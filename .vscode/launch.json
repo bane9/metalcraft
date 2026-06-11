@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:metalcraft}",
+            "name": "Debug Metalcraft",
+            "target": "Metalcraft",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Metalcraft"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:metalcraft}",
+            "name": "Release Metalcraft",
+            "target": "Metalcraft",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Metalcraft"
+        }
+    ]
+}
