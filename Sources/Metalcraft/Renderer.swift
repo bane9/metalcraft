@@ -277,7 +277,16 @@ final class Renderer: NSObject, MTKViewDelegate {
             if let mob = nearestMobHit(origin: player.eye, dir: player.forward, maxDist: reach) {
                 var kb = SIMD3<Float>(player.forward.x, 0, player.forward.z)
                 if simd_length_squared(kb) > 1e-6 { kb = simd_normalize(kb) }
-                mob.hurt(damage: 4, direction: kb)
+                let damage = inventory.selectedStack?.item.attackDamage ?? 4
+                mob.hurt(damage: damage, direction: kb)
+                if mob.dead {
+                    for (item, maxCount) in mob.kind.deathDrops {
+                        let n = Int.random(in: 0...maxCount)
+                        if n > 0 {
+                            spawnDrop(item, count: n, at: mob.pos + SIMD3(0, 0.5, 0))
+                        }
+                    }
+                }
             } else {
                 mine(hit)
             }
@@ -1130,14 +1139,16 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
-    private func dropFor(_ b: Block) -> Item? {
+    private func dropFor(_ b: Block) -> (item: Item, count: Int)? {
         switch b {
-        case .grass: return .block(.dirt) // like Minecraft, grass drops dirt
-        case .stone: return .block(.cobblestone)
-        case .coalOre: return .coal
-        case .diamondOre: return .diamond
-        case .furnaceLit: return .block(.furnace)
-        default: return .block(b)
+        case .grass: return (.block(.dirt), 1) // like Minecraft, grass drops dirt
+        case .stone: return (.block(.cobblestone), 1)
+        case .coalOre: return (.coal, 1)
+        case .diamondOre: return (.diamond, 1)
+        case .redstoneOre: return (.redstone, 4)
+        case .gravel: return Float.random(in: 0...1) < 0.3 ? (.flint, 1) : (.block(.gravel), 1)
+        case .furnaceLit: return (.block(.furnace), 1)
+        default: return (.block(b), 1)
         }
     }
 
@@ -1163,7 +1174,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             }
         }
         if let drop = dropFor(b) {
-            spawnDrop(drop, at: center)
+            spawnDrop(drop.item, count: drop.count, at: center)
         }
     }
 

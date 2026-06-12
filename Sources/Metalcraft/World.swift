@@ -2,7 +2,7 @@ import simd
 
 enum Block: UInt8 {
     case air = 0, grass, dirt, stone, sand, wood, leaves, bedrock, snow, cactus
-    case planks = 10, cobblestone, coalOre, ironOre, goldOre, diamondOre
+    case planks = 10, cobblestone, coalOre, ironOre, goldOre, diamondOre, redstoneOre, gravel
     case craftingTable = 20, furnace, furnaceLit
     // water cases stay contiguous at the end: source, then flowing levels 1-7
     case water = 100, flow1, flow2, flow3, flow4, flow5, flow6, flow7
@@ -198,8 +198,10 @@ struct TerrainGen {
     /// Single-block ore rolls inside stone, denser ores deeper down.
     private func oreAt(_ x: Int, _ y: Int, _ z: Int) -> Block? {
         if hash3(x, y, z, 200) < 0.011 { return .coalOre }
+        if hash3(x, y, z, 204) < 0.012 { return .gravel } // pockets; drops flint
         if y < 32 && hash3(x, y, z, 201) < 0.008 { return .ironOre }
         if y < 20 && hash3(x, y, z, 202) < 0.004 { return .goldOre }
+        if y < 16 && hash3(x, y, z, 205) < 0.006 { return .redstoneOre }
         if y < 13 && hash3(x, y, z, 203) < 0.003 { return .diamondOre }
         return nil
     }

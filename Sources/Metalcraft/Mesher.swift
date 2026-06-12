@@ -107,6 +107,8 @@ enum Mesher {
         case .ironOre: return SIMD2(1, 2)
         case .goldOre: return SIMD2(0, 2)
         case .diamondOre: return SIMD2(2, 3)
+        case .redstoneOre: return SIMD2(3, 3)
+        case .gravel: return SIMD2(3, 1)
         case .craftingTable:
             if dir == 2 { return SIMD2(11, 2) }
             if dir == 3 { return SIMD2(4, 0) }

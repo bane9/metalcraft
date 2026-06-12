@@ -52,6 +52,18 @@ enum MobKind: CaseIterable, Hashable {
         case .zombie, .creeper: return 20
         }
     }
+
+    /// Classic-era death drops (zombies dropped feathers back then).
+    var deathDrops: [(item: Item, max: Int)] {
+        switch self {
+        case .chicken: return [(.feather, 2)]
+        case .zombie: return [(.feather, 2)]
+        case .cow: return [(.leather, 2)]
+        case .pig: return [(.porkchopRaw, 2)]
+        case .creeper: return [(.gunpowder, 2)]
+        case .sheep: return []
+        }
+    }
 }
 
 /// Wandering entity with the same axis-by-axis voxel collision as the player.
