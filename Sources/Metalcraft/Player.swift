@@ -3,6 +3,7 @@ import simd
 struct RayHit {
     var block: SIMD3<Int32>
     var normal: SIMD3<Int32>
+    var t: Float // distance along the ray to the entered face
 }
 
 /// Voxel traversal (Amanatides & Woo DDA): steps the ray cell by cell and
@@ -40,7 +41,7 @@ func raycast(origin: SIMD3<Float>, dir: SIMD3<Float>, maxDist: Float, world: Wor
         if t > maxDist { return nil }
         let b = world.block(Int(ix), Int(iy), Int(iz))
         if b != .air && !b.isWater { // mining ray passes through water
-            return RayHit(block: SIMD3(ix, iy, iz), normal: normal)
+            return RayHit(block: SIMD3(ix, iy, iz), normal: normal, t: t)
         }
     }
     return nil

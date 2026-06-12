@@ -10,7 +10,7 @@ struct Uniforms {
     float4 sunDir;
     float4 fogColor;
     float4 fogParams;   // x = fog start, y = fog end
-    float4 alphaParams; // x = alpha multiplier, y = discard threshold
+    float4 alphaParams; // x = alpha multiplier, y = discard threshold, z = hurt flash
 };
 
 struct VIn {
@@ -62,6 +62,8 @@ fragment float4 block_fragment(VOut in [[stage_in]],
     float diff = max(dot(n, normalize(u.sunDir.xyz)), 0.0);
     float light = 0.45 + 0.55 * diff;
     float3 c = tex.rgb * in.tint * light;
+    // hurt flash: damaged/dying mobs go Minecraft red
+    c = mix(c, c * float3(1.0, 0.3, 0.3), u.alphaParams.z);
 
     float dist = distance(in.worldPos, u.camPos.xyz);
     float f = clamp((dist - u.fogParams.x) / (u.fogParams.y - u.fogParams.x), 0.0, 1.0);

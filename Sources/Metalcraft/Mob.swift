@@ -43,6 +43,15 @@ enum MobKind: CaseIterable, Hashable {
         case .pig, .sheep, .cow: return 1.5
         }
     }
+
+    var maxHealth: Float {
+        switch self {
+        case .chicken: return 4
+        case .sheep: return 8
+        case .pig, .cow: return 10
+        case .zombie, .creeper: return 20
+        }
+    }
 }
 
 /// Wandering entity with the same axis-by-axis voxel collision as the player.
@@ -59,6 +68,11 @@ final class Mob {
     var limbSwing: Float = 0
     var swingAmount: Float = 0
 
+    var health: Float
+    var hurtTime: Float = 0 // red-flash countdown after taking a hit
+    var dead = false
+    var deathTime: Float = 0 // drives the death roll, then despawn
+
     private var targetYaw: Float
     private var walking = false
     private var stateTimer: Float = 0
@@ -67,12 +81,48 @@ final class Mob {
     init(kind: MobKind, pos: SIMD3<Float>) {
         self.kind = kind
         self.pos = pos
+        health = kind.maxHealth
         yaw = Float.random(in: 0..<(2 * .pi))
         targetYaw = yaw
     }
 
+    /// `direction` is the horizontal knockback direction (attacker's facing).
+    func hurt(damage: Float, direction: SIMD3<Float>) {
+        guard !dead else { return }
+        health -= damage
+        hurtTime = 0.5
+        vel.x += direction.x * 7
+        vel.z += direction.z * 7
+        vel.y = max(vel.y, 4.5)
+        if health <= 0 {
+            dead = true
+        } else {
+            // panic: flee along the knockback direction for a bit
+            targetYaw = atan2(direction.x, -direction.z)
+            walking = true
+            stateTimer = 2.5
+        }
+    }
+
     func update(dt: Float, world: World) {
         age += dt
+        hurtTime = max(0, hurtTime - dt)
+
+        if dead {
+            // ragdoll: no steering, just friction and gravity until despawn
+            deathTime += dt
+            vel.x *= exp(-6 * dt)
+            vel.z *= exp(-6 * dt)
+            vel.y = max(vel.y - 28 * dt, -50)
+            onGround = false
+            hitWall = false
+            move(axis: 1, by: vel.y * dt, world: world)
+            move(axis: 0, by: vel.x * dt, world: world)
+            move(axis: 2, by: vel.z * dt, world: world)
+            swingAmount *= exp(-10 * dt)
+            return
+        }
+
         stateTimer -= dt
         if stateTimer <= 0 {
             if Float.random(in: 0...1) < 0.65 {

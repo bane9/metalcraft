@@ -68,6 +68,26 @@ func rotationZMatrix(_ a: Float) -> simd_float4x4 {
     ))
 }
 
+/// Slab test: distance along the ray to the box entry point, nil on miss.
+func rayAABBIntersect(origin: SIMD3<Float>, dir: SIMD3<Float>,
+                      mn: SIMD3<Float>, mx: SIMD3<Float>) -> Float? {
+    var tmin: Float = 0
+    var tmax = Float.infinity
+    for i in 0..<3 {
+        if abs(dir[i]) < 1e-8 {
+            if origin[i] < mn[i] || origin[i] > mx[i] { return nil }
+        } else {
+            var t0 = (mn[i] - origin[i]) / dir[i]
+            var t1 = (mx[i] - origin[i]) / dir[i]
+            if t0 > t1 { swap(&t0, &t1) }
+            tmin = max(tmin, t0)
+            tmax = min(tmax, t1)
+            if tmin > tmax { return nil }
+        }
+    }
+    return tmin
+}
+
 func smoothstepf(_ edge0: Float, _ edge1: Float, _ x: Float) -> Float {
     let t = max(0, min(1, (x - edge0) / (edge1 - edge0)))
     return t * t * (3 - 2 * t)

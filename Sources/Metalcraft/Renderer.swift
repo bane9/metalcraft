@@ -247,7 +247,17 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         let hit = raycast(origin: player.eye, dir: player.forward, maxDist: 6, world: world)
 
-        if input.leftClicks > 0 { mine(hit) }
+        if input.leftClicks > 0 {
+            // punch a mob if one is in reach and closer than the targeted block
+            let reach = min(hit?.t ?? .infinity, 3.5)
+            if let mob = nearestMobHit(origin: player.eye, dir: player.forward, maxDist: reach) {
+                var kb = SIMD3<Float>(player.forward.x, 0, player.forward.z)
+                if simd_length_squared(kb) > 1e-6 { kb = simd_normalize(kb) }
+                mob.hurt(damage: 4, direction: kb)
+            } else {
+                mine(hit)
+            }
+        }
         if input.rightClicks > 0 { place(hit) }
         input.leftClicks = 0
         input.rightClicks = 0
@@ -340,16 +350,21 @@ final class Renderer: NSObject, MTKViewDelegate {
                                       indexBufferOffset: 0)
         }
 
-        // mobs: boxed models with swinging limbs and a walk-cycle body bob
+        // mobs: boxed models with swinging limbs and a walk-cycle body bob;
+        // dying mobs flash red, roll onto their side, then despawn
         for mob in mobs {
             let bob = abs(cos(mob.limbSwing)) * 0.05 * mob.swingAmount
-            let entity = translationMatrix(mob.pos + SIMD3(0, bob, 0))
+            var entity = translationMatrix(mob.pos + SIMD3(0, bob, 0))
                 * rotationYMatrix(-mob.yaw)
-            let flap: Float = mob.kind == .chicken && !mob.onGround
+            if mob.dead {
+                entity *= rotationZMatrix(min(mob.deathTime / 0.45, 1) * .pi / 2)
+            }
+            let flap: Float = mob.kind == .chicken && !mob.onGround && !mob.dead
                 ? 1.0 + sin(mob.age * 30) * 0.8 : 0
+            let hurt: Float = mob.dead ? 0.65 : (mob.hurtTime > 0 ? 0.7 : 0)
             drawModel(enc, model: model(for: mob.kind), entity: entity,
                       uniforms: uniforms, swing: mob.limbSwing,
-                      amount: mob.swingAmount, headPitch: 0, flap: flap)
+                      amount: mob.swingAmount, headPitch: 0, flap: flap, hurt: hurt)
         }
 
         // the player's own model, visible in third person
@@ -556,9 +571,11 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     private func drawModel(_ enc: MTLRenderCommandEncoder, model: MobModel,
                            entity: simd_float4x4, uniforms: Uniforms,
-                           swing: Float, amount: Float, headPitch: Float, flap: Float) {
+                           swing: Float, amount: Float, headPitch: Float, flap: Float,
+                           hurt: Float = 0) {
         for part in model.parts {
             var u = uniforms
+            u.alphaParams.z = hurt
             u.model = entity * translationMatrix(part.pivot)
                 * MobModels.animation(for: part.role, baseRotX: part.baseRotX,
                                       swing: swing, amount: amount,
@@ -575,9 +592,29 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
+    private func nearestMobHit(origin: SIMD3<Float>, dir: SIMD3<Float>, maxDist: Float) -> Mob? {
+        var best: Mob?
+        var bestT = maxDist
+        for mob in mobs where !mob.dead {
+            let half = mob.kind.halfWidth
+            guard let t = rayAABBIntersect(
+                origin: origin, dir: dir,
+                mn: mob.pos - SIMD3(half, 0, half),
+                mx: mob.pos + SIMD3(half, mob.kind.height, half)),
+                t < bestT else { continue }
+            bestT = t
+            best = mob
+        }
+        return best
+    }
+
     private func updateMobs(dt: Float) {
         for mob in mobs { mob.update(dt: dt, world: world) }
-        mobs.removeAll { simd_distance($0.pos, player.pos) > 110 || $0.pos.y < -20 }
+        mobs.removeAll {
+            ($0.dead && $0.deathTime > 1.6)
+                || simd_distance($0.pos, player.pos) > 110
+                || $0.pos.y < -20
+        }
 
         mobSpawnTimer -= dt
         guard mobSpawnTimer <= 0 else { return }
