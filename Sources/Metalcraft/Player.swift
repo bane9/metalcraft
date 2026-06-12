@@ -155,9 +155,14 @@ final class Player {
         move(axis: 2, by: vel.z * dt, world: world)
 
         // Minecraft-style hop out of water: swimming against a ledge boosts
-        // you up so you can actually climb onto the shore
-        if inWater && hitWall && simd_length_squared(wishDir) > 0 {
-            vel.y = max(vel.y, 6.5)
+        // you up. Checked at feet level so the boost stays alive right at the
+        // surface (where the waist is already out of the water), and strong
+        // enough (8² / 2g ≈ 1.14) to lift the feet over a full block.
+        let feetInWater = world.block(Int(pos.x.rounded(.down)),
+                                      Int((pos.y + 0.2).rounded(.down)),
+                                      Int(pos.z.rounded(.down))).isWater
+        if feetInWater && hitWall && simd_length_squared(wishDir) > 0 {
+            vel.y = max(vel.y, 8.0)
         }
 
         let hspeed = simd_length(SIMD2(vel.x, vel.z))
