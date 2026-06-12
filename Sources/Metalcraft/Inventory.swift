@@ -1,14 +1,11 @@
 import simd
 
-struct ItemStack {
-    var block: Block
-    var count: Int
-}
-
-/// Nine-slot Minecraft-style hotbar. Mining feeds it via item pickups,
-/// placing consumes from the selected slot.
+/// Full Minecraft-style inventory: slots 0-8 are the hotbar, 9-35 the main
+/// grid shown in the inventory screen. Mining feeds it via item pickups,
+/// placing consumes from the selected hotbar slot.
 final class Inventory {
-    static let slotCount = 9
+    static let hotbarCount = 9
+    static let slotCount = 36
     static let stackLimit = 64
 
     var slots: [ItemStack?] = Array(repeating: nil, count: slotCount)
@@ -16,27 +13,32 @@ final class Inventory {
 
     var selectedStack: ItemStack? { slots[selected] }
 
-    /// Returns false when no slot can take the item (drop stays on the ground).
-    func add(_ b: Block) -> Bool {
-        for i in 0..<slots.count {
-            if var stack = slots[i], stack.block == b, stack.count < Self.stackLimit {
-                stack.count += 1
+    /// Returns false when nothing can take the items (drop stays on the
+    /// ground). Tops up matching stacks before opening new slots.
+    @discardableResult
+    func add(_ item: Item, count: Int = 1) -> Bool {
+        var remaining = count
+        for i in 0..<slots.count where remaining > 0 {
+            if var stack = slots[i], stack.item == item, stack.count < Self.stackLimit {
+                let take = min(Self.stackLimit - stack.count, remaining)
+                stack.count += take
+                remaining -= take
                 slots[i] = stack
-                return true
             }
         }
-        for i in 0..<slots.count where slots[i] == nil {
-            slots[i] = ItemStack(block: b, count: 1)
-            return true
+        for i in 0..<slots.count where remaining > 0 && slots[i] == nil {
+            let take = min(Self.stackLimit, remaining)
+            slots[i] = ItemStack(item: item, count: take)
+            remaining -= take
         }
-        return false
+        return remaining == 0
     }
 
-    func consumeSelected() -> Block? {
+    func consumeSelected() -> Item? {
         guard var stack = slots[selected] else { return nil }
         stack.count -= 1
         slots[selected] = stack.count > 0 ? stack : nil
-        return stack.block
+        return stack.item
     }
 
     func clear() {
@@ -45,16 +47,18 @@ final class Inventory {
     }
 }
 
-/// A mined block bouncing on the ground as a mini 3D model, waiting to be
-/// picked up.
+/// A mined drop bouncing on the ground, waiting to be picked up. Blocks show
+/// as mini cubes, materials as flat sprites.
 final class ItemEntity {
-    var block: Block
+    var item: Item
+    var count: Int
     var pos: SIMD3<Float> // center
     var vel: SIMD3<Float>
     var age: Float = 0
 
-    init(block: Block, pos: SIMD3<Float>, vel: SIMD3<Float>) {
-        self.block = block
+    init(item: Item, pos: SIMD3<Float>, vel: SIMD3<Float>, count: Int = 1) {
+        self.item = item
+        self.count = count
         self.pos = pos
         self.vel = vel
     }

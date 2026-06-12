@@ -32,6 +32,7 @@ window.title = "Metalcraft"
 
 let gameView = GameView(frame: contentRect, device: device)
 let renderer = Renderer(device: device, view: gameView, input: gameView.input)
+renderer.gameView = gameView
 gameView.delegate = renderer
 
 let hud = NSTextField(labelWithString: "")

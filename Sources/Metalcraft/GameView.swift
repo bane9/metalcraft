@@ -15,6 +15,7 @@ enum Keys {
     static let seven: UInt16 = 26
     static let eight: UInt16 = 28
     static let nine: UInt16 = 25
+    static let e: UInt16 = 14
     static let space: UInt16 = 49
     static let escape: UInt16 = 53
     static let f5: UInt16 = 96
@@ -30,6 +31,12 @@ final class Input {
     var scrollSteps = 0 // hotbar slot cycling
     var captured = false
     var sprint = false
+
+    // GUI mode: the cursor is released and clicks route to the open screen
+    var guiOpen = false
+    var cursor = CGPoint.zero // view coords, AppKit y-up
+    var guiLeftClicks: [CGPoint] = []
+    var guiRightClicks: [CGPoint] = []
 }
 
 final class GameView: MTKView {
@@ -75,11 +82,21 @@ final class GameView: MTKView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        if input.captured { input.leftClicks += 1 } else { setCaptured(true) }
+        if input.guiOpen {
+            input.guiLeftClicks.append(convert(event.locationInWindow, from: nil))
+        } else if input.captured {
+            input.leftClicks += 1
+        } else {
+            setCaptured(true)
+        }
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        if input.captured { input.rightClicks += 1 }
+        if input.guiOpen {
+            input.guiRightClicks.append(convert(event.locationInWindow, from: nil))
+        } else if input.captured {
+            input.rightClicks += 1
+        }
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -93,6 +110,7 @@ final class GameView: MTKView {
     override func rightMouseDragged(with event: NSEvent) { accumulate(event) }
 
     private func accumulate(_ event: NSEvent) {
+        input.cursor = convert(event.locationInWindow, from: nil)
         guard input.captured else { return }
         input.mouseDX += Float(event.deltaX)
         input.mouseDY += Float(event.deltaY)
@@ -100,7 +118,12 @@ final class GameView: MTKView {
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == Keys.escape {
-            setCaptured(false)
+            if input.guiOpen {
+                // the renderer closes the open screen and recaptures
+                if !event.isARepeat { input.pressed.append(event.keyCode) }
+            } else {
+                setCaptured(false)
+            }
             return
         }
         if !event.isARepeat { input.pressed.append(event.keyCode) }

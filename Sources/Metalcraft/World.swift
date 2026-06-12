@@ -2,8 +2,10 @@ import simd
 
 enum Block: UInt8 {
     case air = 0, grass, dirt, stone, sand, wood, leaves, bedrock, snow, cactus
+    case planks = 10, cobblestone, coalOre, ironOre, goldOre, diamondOre
+    case craftingTable = 20, furnace, furnaceLit
     // water cases stay contiguous at the end: source, then flowing levels 1-7
-    case water = 10, flow1, flow2, flow3, flow4, flow5, flow6, flow7
+    case water = 100, flow1, flow2, flow3, flow4, flow5, flow6, flow7
 }
 
 extension Block {
@@ -188,6 +190,20 @@ final class World {
 struct TerrainGen {
     let seed: UInt64
 
+    /// 3D variant for ore scattering: folds y into the 2D column hash.
+    private func hash3(_ x: Int, _ y: Int, _ z: Int, _ salt: UInt64) -> Float {
+        hash01(x &+ y &* 7919, z &- y &* 6271, salt)
+    }
+
+    /// Single-block ore rolls inside stone, denser ores deeper down.
+    private func oreAt(_ x: Int, _ y: Int, _ z: Int) -> Block? {
+        if hash3(x, y, z, 200) < 0.011 { return .coalOre }
+        if y < 32 && hash3(x, y, z, 201) < 0.008 { return .ironOre }
+        if y < 20 && hash3(x, y, z, 202) < 0.004 { return .goldOre }
+        if y < 13 && hash3(x, y, z, 203) < 0.003 { return .diamondOre }
+        return nil
+    }
+
     private func hash01(_ x: Int, _ z: Int, _ salt: UInt64) -> Float {
         var h = seed &+ salt &* 0xD6E8FEB86659FD93
         h ^= UInt64(bitPattern: Int64(x)) &* 0x9E3779B97F4A7C15
@@ -273,7 +289,7 @@ struct TerrainGen {
                     if y == 0 {
                         b = .bedrock
                     } else if y < h - 4 {
-                        b = .stone
+                        b = oreAt(x, y, z) ?? .stone
                     } else if y < h {
                         switch biome {
                         case .desert: b = .sand

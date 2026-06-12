@@ -11,6 +11,7 @@ let package = Package(
             resources: [
                 .copy("Resources/terrain.png"),
                 .copy("Resources/mob"),
+                .copy("Resources/gui"),
             ]
         )
     ]

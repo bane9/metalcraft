@@ -77,6 +77,34 @@ struct LineUniforms {
     float4 color;
 };
 
+// Textured UI quads (GUI dialogs, hotbar, item sprites): unlit, nearest
+// sampling, transparent texels discarded. Vertices are packed [x y z u v].
+struct UIVOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex UIVOut ui_vertex(uint vid [[vertex_id]],
+                        const device float *verts [[buffer(0)]],
+                        constant LineUniforms &u [[buffer(1)]]) {
+    UIVOut out;
+    out.position = u.mvp * float4(verts[vid * 5], verts[vid * 5 + 1], verts[vid * 5 + 2], 1.0);
+    out.uv = float2(verts[vid * 5 + 3], verts[vid * 5 + 4]);
+    return out;
+}
+
+constexpr sampler ui_sampler(mag_filter::nearest, min_filter::nearest);
+
+fragment float4 ui_fragment(UIVOut in [[stage_in]],
+                            constant LineUniforms &u [[buffer(1)]],
+                            texture2d<float> tex [[texture(0)]]) {
+    float4 c = tex.sample(ui_sampler, in.uv);
+    if (c.a < 0.01) {
+        discard_fragment();
+    }
+    return c * u.color;
+}
+
 vertex float4 line_vertex(uint vid [[vertex_id]],
                           const device packed_float3 *verts [[buffer(0)]],
                           constant LineUniforms &u [[buffer(1)]]) {

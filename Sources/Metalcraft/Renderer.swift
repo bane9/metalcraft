@@ -53,6 +53,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     let waterPipeline: MTLRenderPipelineState
     let linePipeline: MTLRenderPipelineState
     let uiPipeline: MTLRenderPipelineState
+    let uiTexPipeline: MTLRenderPipelineState
     let depthOn: MTLDepthStencilState
     let depthReadOnly: MTLDepthStencilState
     let depthOff: MTLDepthStencilState
@@ -68,16 +69,21 @@ final class Renderer: NSObject, MTKViewDelegate {
     var mobs: [Mob] = []
     let input: Input
     weak var hud: NSTextField?
-    private var countLabels: [NSTextField] = []
+    weak var gameView: GameView?
+    private var countLabels: [NSTextField] = [] // pooled stack-count overlays
 
     private var meshes: [ChunkCoord: ChunkMesh] = [:]
     private var itemMeshCache: [UInt8: CubeMesh] = [:]
     private var iconMeshCache: [UInt8: CubeMesh] = [:]
+    private var spriteMeshCache: [Item: CubeMesh] = [:]
     private var mobModelCache: [MobKind: MobModel] = [:]
-    private var mobTextureCache: [String: MTLTexture] = [:]
+    private var textureCache: [String: MTLTexture] = [:]
     private lazy var playerModel = buildModel(MobModels.humanoid(), textureNames: ["char"])
     private var mobSpawnTimer: Float = 0
     private var thirdPerson = false
+
+    let gui = GUIState()
+    var furnaces: [BlockPos: FurnaceState] = [:]
     private var aspect: Float = 16.0 / 9.0
     private var lastTime = CACurrentMediaTime()
     private var lastSpaceTap: CFTimeInterval = -10
@@ -137,6 +143,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         waterPipeline = makePipeline(vertex: "block_vertex", fragment: "block_fragment", blended: true)
         linePipeline = makePipeline(vertex: "line_vertex", fragment: "line_fragment", blended: false)
         uiPipeline = makePipeline(vertex: "line_vertex", fragment: "line_fragment", blended: true)
+        uiTexPipeline = makePipeline(vertex: "ui_vertex", fragment: "ui_fragment", blended: true)
 
         func makeDepthState(compare: MTLCompareFunction, write: Bool) -> MTLDepthStencilState {
             let d = MTLDepthStencilDescriptor()
@@ -194,15 +201,6 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         super.init()
 
-        for _ in 0..<Inventory.slotCount {
-            let label = NSTextField(labelWithString: "")
-            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .bold)
-            label.textColor = .white
-            label.isHidden = true
-            view.addSubview(label)
-            countLabels.append(label)
-        }
-
         resetWorld()
     }
 
@@ -221,10 +219,12 @@ final class Renderer: NSObject, MTKViewDelegate {
         finishedMeshes.removeAll()
         resultLock.unlock()
 
+        if gui.screen != nil { closeGUI() }
         world.reset(seed: UInt64.random(in: 0...UInt64.max))
         meshes.removeAll()
         items.removeAll()
         mobs.removeAll()
+        furnaces.removeAll()
         inventory.clear()
         for dz in -2...2 {
             for dx in -2...2 { world.generateChunk(ChunkCoord(x: dx, z: dz)) }
@@ -250,10 +250,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         for key in input.pressed { handleKeyPress(key, now: now) }
         input.pressed.removeAll()
         if input.scrollSteps != 0 {
-            let n = Inventory.slotCount
+            let n = Inventory.hotbarCount
             inventory.selected = ((inventory.selected + input.scrollSteps) % n + n) % n
             input.scrollSteps = 0
         }
+        processGUIClicks(view: view)
 
         integrateFinishedWork()
         streamGeneration()
@@ -281,12 +282,13 @@ final class Renderer: NSObject, MTKViewDelegate {
                 mine(hit)
             }
         }
-        if input.rightClicks > 0 { place(hit) }
+        if input.rightClicks > 0 { rightClick(hit) }
         input.leftClicks = 0
         input.rightClicks = 0
 
         updateItems(dt: dt)
         updateMobs(dt: dt)
+        tickFurnaces(dt: dt)
         remeshDirtyChunks()
         streamMeshes()
 
@@ -357,14 +359,21 @@ final class Renderer: NSObject, MTKViewDelegate {
                                       indexBufferOffset: 0)
         }
 
-        // dropped items: spinning, bobbing mini cubes
+        // dropped items: blocks spin as mini cubes, materials as flat sprites
         for item in items {
             let bob = sin(item.age * 2.0) * 0.04
             var iu = uniforms
             iu.model = translationMatrix(item.pos + SIMD3(0, bob, 0))
                 * rotationYMatrix(item.age * 1.6)
-                * scaleMatrix(SIMD3(repeating: 0.25))
-            let mesh = cubeMesh(for: item.block, icon: false)
+            let mesh: CubeMesh
+            if let b = item.item.asBlock {
+                iu.model *= scaleMatrix(SIMD3(repeating: 0.25))
+                mesh = cubeMesh(for: b, icon: false)
+                enc.setFragmentTexture(atlas, index: 0)
+            } else {
+                mesh = spriteMesh(for: item.item)
+                enc.setFragmentTexture(texture("items", "gui"), index: 0)
+            }
             enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
             enc.setVertexBytes(&iu, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentBytes(&iu, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -372,6 +381,7 @@ final class Renderer: NSObject, MTKViewDelegate {
                                       indexType: .uint32, indexBuffer: mesh.indexBuffer,
                                       indexBufferOffset: 0)
         }
+        enc.setFragmentTexture(atlas, index: 0)
 
         // mobs: boxed models with swinging limbs and a walk-cycle body bob;
         // dying mobs flash red, roll onto their side, then despawn
@@ -430,31 +440,58 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         drawHotbar(enc, view: view, baseUniforms: uniforms)
 
-        // crosshair, drawn in NDC with depth test off
-        enc.setRenderPipelineState(linePipeline)
-        enc.setDepthStencilState(depthOff)
-        let s: Float = 0.014
-        var cu = LineUniforms(mvp: scaleMatrix(SIMD3(s, s * aspect, 1)),
-                              color: SIMD4(1, 1, 1, 1))
-        enc.setVertexBuffer(crosshairBuffer, offset: 0, index: 0)
-        enc.setVertexBytes(&cu, length: MemoryLayout<LineUniforms>.stride, index: 1)
-        enc.setFragmentBytes(&cu, length: MemoryLayout<LineUniforms>.stride, index: 1)
-        enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: 4)
+        if gui.screen == nil {
+            // crosshair, drawn in NDC with depth test off
+            enc.setRenderPipelineState(linePipeline)
+            enc.setDepthStencilState(depthOff)
+            let s: Float = 0.014
+            var cu = LineUniforms(mvp: scaleMatrix(SIMD3(s, s * aspect, 1)),
+                                  color: SIMD4(1, 1, 1, 1))
+            enc.setVertexBuffer(crosshairBuffer, offset: 0, index: 0)
+            enc.setVertexBytes(&cu, length: MemoryLayout<LineUniforms>.stride, index: 1)
+            enc.setFragmentBytes(&cu, length: MemoryLayout<LineUniforms>.stride, index: 1)
+            enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: 4)
+        }
+
+        updateCountLabels(view: view)
 
         enc.endEncoding()
+
+        // Container screens render in a second pass with a cleared depth
+        // buffer, so the inventory's player preview can depth-test against
+        // itself while drawing over the finished world frame.
+        if gui.screen != nil, let depthTex = rpd.depthAttachment.texture {
+            let rpd2 = MTLRenderPassDescriptor()
+            rpd2.colorAttachments[0].texture = drawable.texture
+            rpd2.colorAttachments[0].loadAction = .load
+            rpd2.colorAttachments[0].storeAction = .store
+            rpd2.depthAttachment.texture = depthTex
+            rpd2.depthAttachment.loadAction = .clear
+            rpd2.depthAttachment.clearDepth = 1
+            rpd2.depthAttachment.storeAction = .dontCare
+            if let enc2 = cmd.makeRenderCommandEncoder(descriptor: rpd2) {
+                drawGUI(enc2, view: view, baseUniforms: uniforms)
+                enc2.endEncoding()
+            }
+        }
+
         cmd.present(drawable)
         cmd.commit()
     }
 
-    // MARK: - Hotbar
+    // MARK: - UI (hotbar + container screens)
 
-    private let slotSize: CGFloat = 48
-    private let slotGap: CGFloat = 6
+    /// Classic GUI pixel scale: dialog art is 176×166, hotbar 182×22.
+    private let uiScale: CGFloat = 2
 
-    private func slotOrigin(_ i: Int, _ bounds: CGSize) -> CGPoint {
-        let totalW = slotSize * CGFloat(Inventory.slotCount) + slotGap * CGFloat(Inventory.slotCount - 1)
-        let x0 = (bounds.width - totalW) / 2
-        return CGPoint(x: x0 + CGFloat(i) * (slotSize + slotGap), y: 10)
+    private func texture(_ name: String, _ subdirectory: String) -> MTLTexture {
+        let key = subdirectory + "/" + name
+        if let t = textureCache[key] { return t }
+        let url = Bundle.module.url(forResource: name, withExtension: "png",
+                                    subdirectory: subdirectory)!
+        let t = try! MTKTextureLoader(device: device).newTexture(URL: url, options: [.SRGB: false])
+        textureCache[key] = t
+        return t
     }
 
     private func ndcRect(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat, _ b: CGSize) -> simd_float4x4 {
@@ -462,56 +499,328 @@ final class Renderer: NSObject, MTKViewDelegate {
             * scaleMatrix(SIMD3(Float(w / b.width) * 2, Float(h / b.height) * 2, 1))
     }
 
-    private func drawHotbar(_ enc: MTLRenderCommandEncoder, view: MTKView, baseUniforms: Uniforms) {
-        let bounds = view.bounds.size
-        guard bounds.width > 1, bounds.height > 1 else { return }
-        enc.setDepthStencilState(depthOff)
-
-        // slot backgrounds + selection frame
+    private func drawSolidQuad(_ enc: MTLRenderCommandEncoder, _ mvp: simd_float4x4,
+                               _ color: SIMD4<Float>) {
         enc.setRenderPipelineState(uiPipeline)
         enc.setVertexBuffer(quadBuffer, offset: 0, index: 0)
-        func drawQuad(_ mvp: simd_float4x4, _ color: SIMD4<Float>) {
-            var lu = LineUniforms(mvp: mvp, color: color)
-            enc.setVertexBytes(&lu, length: MemoryLayout<LineUniforms>.stride, index: 1)
-            enc.setFragmentBytes(&lu, length: MemoryLayout<LineUniforms>.stride, index: 1)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-        }
-        for i in 0..<Inventory.slotCount {
-            let o = slotOrigin(i, bounds)
-            if i == inventory.selected {
-                drawQuad(ndcRect(o.x - 3, o.y - 3, slotSize + 6, slotSize + 6, bounds),
-                         SIMD4(1, 1, 1, 0.85))
-            }
-            drawQuad(ndcRect(o.x, o.y, slotSize, slotSize, bounds), SIMD4(0, 0, 0, 0.55))
-        }
+        var lu = LineUniforms(mvp: mvp, color: color)
+        enc.setVertexBytes(&lu, length: MemoryLayout<LineUniforms>.stride, index: 1)
+        enc.setFragmentBytes(&lu, length: MemoryLayout<LineUniforms>.stride, index: 1)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+    }
 
-        // isometric mini-cube icons
-        enc.setRenderPipelineState(blockPipeline)
-        enc.setFragmentTexture(atlas, index: 0)
-        var iu = baseUniforms
-        iu.viewProj = matrix_identity_float4x4
-        iu.camPos = SIMD4(0, 0, 0, 0)
-        iu.fogParams = SIMD4(1e8, 2e8, 0, 0) // no fog on UI
-        iu.alphaParams = SIMD4(1.0, 0.5, 0, 0)
-        for i in 0..<Inventory.slotCount {
-            guard let stack = inventory.slots[i] else { continue }
-            let o = slotOrigin(i, bounds)
-            let cx = Float((o.x + slotSize / 2) / bounds.width) * 2 - 1
-            let cy = Float((o.y + slotSize / 2) / bounds.height) * 2 - 1
-            let sy = Float(slotSize * 0.34 / bounds.height) * 2
+    /// Blit a pixel region of a 256×256 GUI texture into a view rect.
+    /// `rect` is in view points (AppKit y-up).
+    private func drawUIQuad(_ enc: MTLRenderCommandEncoder, texture tex: MTLTexture,
+                            rect: CGRect, srcX: Float, srcY: Float, srcW: Float, srcH: Float,
+                            bounds: CGSize) {
+        let nx0 = Float(rect.minX / bounds.width) * 2 - 1
+        let ny0 = Float(rect.minY / bounds.height) * 2 - 1
+        let nx1 = Float(rect.maxX / bounds.width) * 2 - 1
+        let ny1 = Float(rect.maxY / bounds.height) * 2 - 1
+        let u0 = srcX / 256, v0 = srcY / 256
+        let u1 = (srcX + srcW) / 256, v1 = (srcY + srcH) / 256
+        // texture v runs top-down, view y runs bottom-up
+        let verts: [Float] = [
+            nx0, ny0, 0, u0, v1,
+            nx1, ny0, 0, u1, v1,
+            nx1, ny1, 0, u1, v0,
+            nx0, ny0, 0, u0, v1,
+            nx1, ny1, 0, u1, v0,
+            nx0, ny1, 0, u0, v0,
+        ]
+        var lu = LineUniforms(mvp: matrix_identity_float4x4, color: SIMD4(1, 1, 1, 1))
+        enc.setRenderPipelineState(uiTexPipeline)
+        enc.setFragmentTexture(tex, index: 0)
+        enc.setVertexBytes(verts, length: verts.count * 4, index: 0)
+        enc.setVertexBytes(&lu, length: MemoryLayout<LineUniforms>.stride, index: 1)
+        enc.setFragmentBytes(&lu, length: MemoryLayout<LineUniforms>.stride, index: 1)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+    }
+
+    /// A 16×16 item graphic centered at `center`: blocks as isometric mini
+    /// cubes, materials as items.png sprites.
+    private func drawItemIcon(_ enc: MTLRenderCommandEncoder, item: Item,
+                              center: CGPoint, size: CGFloat,
+                              bounds: CGSize, baseUniforms: Uniforms) {
+        if let b = item.asBlock {
+            enc.setRenderPipelineState(blockPipeline)
+            enc.setFragmentTexture(atlas, index: 0)
+            var iu = baseUniforms
+            iu.viewProj = matrix_identity_float4x4
+            iu.camPos = SIMD4(0, 0, 0, 0)
+            iu.fogParams = SIMD4(1e8, 2e8, 0, 0) // no fog on UI
+            iu.alphaParams = SIMD4(1.0, 0.5, 0, 0)
+            let cx = Float(center.x / bounds.width) * 2 - 1
+            let cy = Float(center.y / bounds.height) * 2 - 1
+            let sy = Float(size * 0.36 / bounds.height) * 2
             let sx = sy * Float(bounds.height / bounds.width)
             iu.model = translationMatrix(SIMD3(cx, cy, 0.5))
                 * scaleMatrix(SIMD3(sx, sy, 0.1))
                 * rotationXMatrix(-0.52)
                 * rotationYMatrix(.pi / 4)
-            let mesh = cubeMesh(for: stack.block, icon: true)
+            let mesh = cubeMesh(for: b, icon: true)
             enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
             enc.setVertexBytes(&iu, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.setFragmentBytes(&iu, length: MemoryLayout<Uniforms>.stride, index: 1)
             enc.drawIndexedPrimitives(type: .triangle, indexCount: mesh.indexCount,
                                       indexType: .uint32, indexBuffer: mesh.indexBuffer,
                                       indexBufferOffset: 0)
+        } else if let t = item.sprite {
+            drawUIQuad(enc, texture: texture("items", "gui"),
+                       rect: CGRect(x: center.x - size / 2, y: center.y - size / 2,
+                                    width: size, height: size),
+                       srcX: t.x * 16, srcY: t.y * 16, srcW: 16, srcH: 16, bounds: bounds)
         }
+    }
+
+    // MARK: - Hotbar
+
+    private func hotbarOrigin(_ bounds: CGSize) -> CGPoint {
+        CGPoint(x: (bounds.width - 182 * uiScale) / 2, y: 8)
+    }
+
+    /// Center of hotbar slot i's 16×16 interior (slots start at x=3+20i, y=3).
+    private func hotbarSlotCenter(_ i: Int, _ bounds: CGSize) -> CGPoint {
+        let o = hotbarOrigin(bounds)
+        return CGPoint(x: o.x + (3 + CGFloat(i) * 20 + 8) * uiScale,
+                       y: o.y + 11 * uiScale)
+    }
+
+    private func drawHotbar(_ enc: MTLRenderCommandEncoder, view: MTKView, baseUniforms: Uniforms) {
+        let bounds = view.bounds.size
+        guard bounds.width > 1, bounds.height > 1 else { return }
+        enc.setDepthStencilState(depthOff)
+
+        let guiTex = texture("gui", "gui")
+        let o = hotbarOrigin(bounds)
+        drawUIQuad(enc, texture: guiTex,
+                   rect: CGRect(x: o.x, y: o.y, width: 182 * uiScale, height: 22 * uiScale),
+                   srcX: 0, srcY: 0, srcW: 182, srcH: 22, bounds: bounds)
+        drawUIQuad(enc, texture: guiTex,
+                   rect: CGRect(x: o.x + (CGFloat(inventory.selected) * 20 - 1) * uiScale,
+                                y: o.y - 1 * uiScale,
+                                width: 24 * uiScale, height: 24 * uiScale),
+                   srcX: 0, srcY: 22, srcW: 24, srcH: 24, bounds: bounds)
+
+        for i in 0..<Inventory.hotbarCount {
+            guard let stack = inventory.slots[i] else { continue }
+            drawItemIcon(enc, item: stack.item, center: hotbarSlotCenter(i, bounds),
+                         size: 16 * uiScale, bounds: bounds, baseUniforms: baseUniforms)
+        }
+    }
+
+    // MARK: - Container screens
+
+    /// Dialog px (top-left origin, y down) → view rect (y up). All dialogs
+    /// are 176×166, centered on screen.
+    private func guiRect(_ dx: CGFloat, _ dy: CGFloat, _ w: CGFloat, _ h: CGFloat,
+                         _ bounds: CGSize) -> CGRect {
+        let ox = (bounds.width - 176 * uiScale) / 2
+        let oyTop = (bounds.height + 166 * uiScale) / 2
+        return CGRect(x: ox + dx * uiScale, y: oyTop - (dy + h) * uiScale,
+                      width: w * uiScale, height: h * uiScale)
+    }
+
+    private var currentFurnace: FurnaceState? {
+        if case .furnace(let pos)? = gui.screen { return furnaces[pos] }
+        return nil
+    }
+
+    private func drawGUI(_ enc: MTLRenderCommandEncoder, view: MTKView, baseUniforms: Uniforms) {
+        guard let screen = gui.screen else { return }
+        let bounds = view.bounds.size
+        guard bounds.width > 1, bounds.height > 1 else { return }
+        enc.setDepthStencilState(depthOff)
+
+        // dimmed world behind the dialog
+        drawSolidQuad(enc, ndcRect(0, 0, bounds.width, bounds.height, bounds),
+                      SIMD4(0, 0, 0, 0.55))
+
+        let dialogTex = texture(screen.textureName, "gui")
+        drawUIQuad(enc, texture: dialogTex, rect: guiRect(0, 0, 176, 166, bounds),
+                   srcX: 0, srcY: 0, srcW: 176, srcH: 166, bounds: bounds)
+
+        if case .inventory = screen {
+            drawPlayerPreview(enc, bounds: bounds, baseUniforms: baseUniforms)
+        }
+
+        // furnace flame + progress arrow, cropped by their fractions
+        if let f = currentFurnace {
+            if f.isBurning {
+                let frac = max(0, min(1, f.burnLeft / f.burnTotal))
+                let h = CGFloat((14 * frac).rounded())
+                drawUIQuad(enc, texture: dialogTex,
+                           rect: guiRect(56, 36 + (14 - h), 14, h, bounds),
+                           srcX: 176, srcY: Float(14 - h), srcW: 14, srcH: Float(h),
+                           bounds: bounds)
+            }
+            let cookW = (24 * CGFloat(f.cook / FurnaceState.cookTime)).rounded()
+            if cookW > 0 {
+                drawUIQuad(enc, texture: dialogTex,
+                           rect: guiRect(79, 34, cookW, 17, bounds),
+                           srcX: 176, srcY: 14, srcW: Float(cookW), srcH: 17, bounds: bounds)
+            }
+        }
+
+        // slot contents
+        for slot in gui.slots {
+            guard let stack = gui.read(slot.source, inventory: inventory, furnace: currentFurnace)
+            else { continue }
+            let r = guiRect(CGFloat(slot.x), CGFloat(slot.y), 16, 16, bounds)
+            drawItemIcon(enc, item: stack.item, center: CGPoint(x: r.midX, y: r.midY),
+                         size: 16 * uiScale, bounds: bounds, baseUniforms: baseUniforms)
+        }
+
+        // stack picked up on the cursor
+        if let held = gui.held {
+            drawItemIcon(enc, item: held.item, center: input.cursor,
+                         size: 16 * uiScale, bounds: bounds, baseUniforms: baseUniforms)
+        }
+    }
+
+    /// The character in the inventory screen's preview box, turning to track
+    /// the cursor like the real game.
+    private func drawPlayerPreview(_ enc: MTLRenderCommandEncoder, bounds: CGSize,
+                                   baseUniforms: Uniforms) {
+        let pxPerMeter = 30 * uiScale // 1.8 m model ≈ 54 px in the 72 px box
+        let feetRect = guiRect(52, 76, 0, 0, bounds)
+        let feet = CGPoint(x: feetRect.minX, y: feetRect.minY)
+        let cx = Float(feet.x / bounds.width) * 2 - 1
+        let cy = Float(feet.y / bounds.height) * 2 - 1
+        let sx = Float(pxPerMeter / bounds.width) * 2
+        let sy = Float(pxPerMeter / bounds.height) * 2
+
+        let eyeY = feet.y + 1.62 * pxPerMeter
+        let dx = Float(input.cursor.x - feet.x)
+        let dy = Float(input.cursor.y - eyeY)
+        let bodyYaw = max(-0.7, min(0.7, dx / 400))
+        let headPitch = max(-0.6, min(0.6, dy / 400))
+
+        var u = baseUniforms
+        // orthographic blow-up of the model into the preview box; negative z
+        // scale keeps "toward the viewer" at smaller depth
+        u.viewProj = translationMatrix(SIMD3(cx, cy, 0.5))
+            * scaleMatrix(SIMD3(sx, sy, -0.05))
+        u.camPos = SIMD4(0, 0, 0, 0)
+        u.sunDir = SIMD4(simd_normalize(SIMD3<Float>(0.3, 0.6, 0.9)), 0)
+        u.fogParams = SIMD4(1e8, 2e8, 0, 0)
+        u.alphaParams = SIMD4(1.0, 0.5, 0, 0)
+
+        enc.setRenderPipelineState(blockPipeline)
+        enc.setDepthStencilState(depthOn)
+        drawModel(enc, model: playerModel, entity: rotationYMatrix(.pi + bodyYaw),
+                  uniforms: u, swing: 0, amount: 0, headPitch: headPitch, flap: 0)
+        enc.setDepthStencilState(depthOff)
+    }
+
+    private func slotAt(_ p: CGPoint, bounds: CGSize) -> GUISlot.Source? {
+        for slot in gui.slots
+        where guiRect(CGFloat(slot.x), CGFloat(slot.y), 16, 16, bounds).contains(p) {
+            return slot.source
+        }
+        return nil
+    }
+
+    private func processGUIClicks(view: MTKView) {
+        defer {
+            input.guiLeftClicks.removeAll()
+            input.guiRightClicks.removeAll()
+        }
+        guard gui.screen != nil else { return }
+        let bounds = view.bounds.size
+        for (points, right) in [(input.guiLeftClicks, false), (input.guiRightClicks, true)] {
+            for p in points {
+                guard let source = slotAt(p, bounds: bounds) else { continue }
+                gui.click(source, right: right, inventory: inventory, furnace: currentFurnace)
+            }
+        }
+    }
+
+    func openGUI(_ screen: GUIScreen) {
+        gui.open(screen)
+        input.guiOpen = true
+        gameView?.setCaptured(false)
+    }
+
+    func closeGUI() {
+        for stack in gui.close() where !inventory.add(stack.item, count: stack.count) {
+            items.append(ItemEntity(item: stack.item, pos: player.eye,
+                                    vel: player.forward * 3, count: stack.count))
+        }
+        input.guiOpen = false
+        gameView?.setCaptured(true)
+    }
+
+    // MARK: - Stack count labels
+
+    private func updateCountLabels(view: MTKView) {
+        let bounds = view.bounds.size
+        var requests: [(text: String, x: CGFloat, y: CGFloat)] = []
+
+        for i in 0..<Inventory.hotbarCount {
+            if let stack = inventory.slots[i], stack.count > 1 {
+                let c = hotbarSlotCenter(i, bounds)
+                requests.append(("\(stack.count)", c.x + 8 * uiScale, c.y - 8 * uiScale))
+            }
+        }
+        if gui.screen != nil {
+            for slot in gui.slots {
+                guard let stack = gui.read(slot.source, inventory: inventory,
+                                           furnace: currentFurnace), stack.count > 1
+                else { continue }
+                let r = guiRect(CGFloat(slot.x), CGFloat(slot.y), 16, 16, bounds)
+                requests.append(("\(stack.count)", r.maxX, r.minY))
+            }
+            if let held = gui.held, held.count > 1 {
+                requests.append(("\(held.count)", input.cursor.x + 8 * uiScale,
+                                 input.cursor.y - 8 * uiScale))
+            }
+        }
+
+        while countLabels.count < requests.count {
+            let label = NSTextField(labelWithString: "")
+            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .bold)
+            label.textColor = .white
+            view.addSubview(label)
+            countLabels.append(label)
+        }
+        for (i, label) in countLabels.enumerated() {
+            if i < requests.count {
+                let r = requests[i]
+                if label.stringValue != r.text {
+                    label.stringValue = r.text
+                    label.sizeToFit()
+                }
+                label.setFrameOrigin(NSPoint(x: r.x - label.frame.width, y: r.y))
+                label.isHidden = false
+            } else {
+                label.isHidden = true
+            }
+        }
+    }
+
+    /// Flat double-sided quad showing an items.png sprite, for dropped
+    /// materials like coal or ingots.
+    private func spriteMesh(for item: Item) -> CubeMesh {
+        if let cached = spriteMeshCache[item] { return cached }
+        let t = item.sprite ?? SIMD2(0, 0)
+        let u0 = (t.x * 16 + 0.1) / 256, u1 = (t.x * 16 + 15.9) / 256
+        let v0 = (t.y * 16 + 0.1) / 256, v1 = (t.y * 16 + 15.9) / 256
+        let s: Float = 0.26
+        let verts: [Float] = [
+            -s, -s, 0, 0, 0, 1, u0, v1, 1, 1, 1,
+             s, -s, 0, 0, 0, 1, u1, v1, 1, 1, 1,
+             s,  s, 0, 0, 0, 1, u1, v0, 1, 1, 1,
+            -s,  s, 0, 0, 0, 1, u0, v0, 1, 1, 1,
+        ]
+        let indices: [UInt32] = [0, 1, 2, 0, 2, 3]
+        let mesh = CubeMesh(
+            vertexBuffer: device.makeBuffer(bytes: verts, length: verts.count * 4)!,
+            indexBuffer: device.makeBuffer(bytes: indices, length: indices.count * 4)!,
+            indexCount: indices.count)
+        spriteMeshCache[item] = mesh
+        return mesh
     }
 
     /// Icon meshes only carry the three faces visible from the fixed
@@ -540,7 +849,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             let dist = simd_length(d)
             if item.age > 0.5 && !player.flying {
                 if dist < 1.1 {
-                    if inventory.add(item.block) {
+                    if inventory.add(item.item, count: item.count) {
                         items.remove(at: i)
                         continue
                     }
@@ -561,14 +870,6 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     // MARK: - Mobs
 
-    private func mobTexture(_ name: String) -> MTLTexture {
-        if let t = mobTextureCache[name] { return t }
-        let url = Bundle.module.url(forResource: name, withExtension: "png", subdirectory: "mob")!
-        let t = try! MTKTextureLoader(device: device).newTexture(URL: url, options: [.SRGB: false])
-        mobTextureCache[name] = t
-        return t
-    }
-
     private func buildModel(_ spec: ModelSpec, textureNames: [String]) -> MobModel {
         var parts: [MobPartMesh] = []
         for p in spec.parts {
@@ -582,7 +883,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             parts.append(MobPartMesh(role: p.role, pivot: p.pivot * spec.scale,
                                      baseRotX: p.baseRotX, submeshes: subs))
         }
-        return MobModel(parts: parts, textures: textureNames.map { mobTexture($0) })
+        return MobModel(parts: parts, textures: textureNames.map { texture($0, "mob") })
     }
 
     private func model(for kind: MobKind) -> MobModel {
@@ -804,6 +1105,10 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     private func handleKeyPress(_ key: UInt16, now: CFTimeInterval) {
         switch key {
+        case Keys.e:
+            if gui.screen != nil { closeGUI() } else { openGUI(.inventory) }
+        case Keys.escape:
+            if gui.screen != nil { closeGUI() }
         case Keys.one, Keys.two, Keys.three, Keys.four, Keys.five,
              Keys.six, Keys.seven, Keys.eight, Keys.nine:
             let order: [UInt16] = [Keys.one, Keys.two, Keys.three, Keys.four, Keys.five,
@@ -825,11 +1130,22 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
-    private func dropFor(_ b: Block) -> Block? {
+    private func dropFor(_ b: Block) -> Item? {
         switch b {
-        case .grass: return .dirt // like Minecraft, grass blocks drop dirt
-        default: return b
+        case .grass: return .block(.dirt) // like Minecraft, grass drops dirt
+        case .stone: return .block(.cobblestone)
+        case .coalOre: return .coal
+        case .diamondOre: return .diamond
+        case .furnaceLit: return .block(.furnace)
+        default: return .block(b)
         }
+    }
+
+    private func spawnDrop(_ item: Item, count: Int = 1, at p: SIMD3<Float>) {
+        let vel = SIMD3<Float>(Float.random(in: -1.2...1.2),
+                               Float.random(in: 2.2...3.4),
+                               Float.random(in: -1.2...1.2))
+        items.append(ItemEntity(item: item, pos: p, vel: vel, count: count))
     }
 
     private func mine(_ hit: RayHit?) {
@@ -838,17 +1154,38 @@ final class Renderer: NSObject, MTKViewDelegate {
         let b = world.block(x, y, z)
         guard b != .air && b != .bedrock && !b.isWater else { return }
         world.setBlock(x, y, z, .air)
+        let center = SIMD3<Float>(Float(x) + 0.5, Float(y) + 0.4, Float(z) + 0.5)
+        // a mined furnace spills whatever it held
+        if b == .furnace || b == .furnaceLit,
+           let f = furnaces.removeValue(forKey: BlockPos(x: x, y: y, z: z)) {
+            for stack in [f.input, f.fuel, f.output].compactMap({ $0 }) {
+                spawnDrop(stack.item, count: stack.count, at: center)
+            }
+        }
         if let drop = dropFor(b) {
-            let pos = SIMD3<Float>(Float(x) + 0.5, Float(y) + 0.4, Float(z) + 0.5)
-            let vel = SIMD3<Float>(Float.random(in: -1.2...1.2),
-                                   Float.random(in: 2.2...3.4),
-                                   Float.random(in: -1.2...1.2))
-            items.append(ItemEntity(block: drop, pos: pos, vel: vel))
+            spawnDrop(drop, at: center)
+        }
+    }
+
+    /// Right click: open interactive blocks, otherwise place the selected one.
+    private func rightClick(_ hit: RayHit?) {
+        guard let hit else { return }
+        let x = Int(hit.block.x), y = Int(hit.block.y), z = Int(hit.block.z)
+        switch world.block(x, y, z) {
+        case .craftingTable:
+            openGUI(.craftingTable)
+        case .furnace, .furnaceLit:
+            let pos = BlockPos(x: x, y: y, z: z)
+            if furnaces[pos] == nil { furnaces[pos] = FurnaceState() }
+            openGUI(.furnace(pos))
+        default:
+            place(hit)
         }
     }
 
     private func place(_ hit: RayHit?) {
-        guard let hit, let stack = inventory.selectedStack else { return }
+        guard let hit, let stack = inventory.selectedStack,
+              let block = stack.item.asBlock else { return }
         let p = hit.block &+ hit.normal
         let x = Int(p.x), y = Int(p.y), z = Int(p.z)
         let target = world.block(x, y, z)
@@ -863,34 +1200,36 @@ final class Renderer: NSObject, MTKViewDelegate {
             && pmin.z < bmax.z && pmax.z > bmin.z
         guard !overlaps || player.flying else { return }
 
-        world.setBlock(x, y, z, stack.block)
+        world.setBlock(x, y, z, block)
         _ = inventory.consumeSelected()
+    }
+
+    // MARK: - Furnaces
+
+    private func tickFurnaces(dt: Float) {
+        for (pos, f) in furnaces {
+            f.tick(dt: dt)
+            // keep the block's lit face in sync with the burn state
+            let current = world.block(pos.x, pos.y, pos.z)
+            guard current == .furnace || current == .furnaceLit else { continue }
+            let wanted: Block = f.isBurning ? .furnaceLit : .furnace
+            if current != wanted {
+                world.setBlock(pos.x, pos.y, pos.z, wanted)
+            }
+        }
     }
 
     // MARK: - HUD
 
     private func updateHUD(view: MTKView) {
-        let bounds = view.bounds.size
-        for i in 0..<Inventory.slotCount {
-            let label = countLabels[i]
-            if let stack = inventory.slots[i], stack.count > 1 {
-                label.stringValue = "\(stack.count)"
-                label.sizeToFit()
-                let o = slotOrigin(i, bounds)
-                label.setFrameOrigin(NSPoint(x: o.x + slotSize - label.frame.width - 4,
-                                             y: o.y + 3))
-                label.isHidden = false
-            } else {
-                label.isHidden = true
-            }
-        }
-
         guard let hud else { return }
-        var text = "  WASD move · Space jump · 2×Space fly · F5 view · LMB mine · RMB place · 1-9/scroll slots · R new world  "
-        if player.flying {
+        var text = "  WASD move · Space jump · 2×Space fly · E inventory · F5 view · LMB mine · RMB place/use · R new world  "
+        if gui.screen != nil {
+            text = "  ▸ Click slots to move items · right-click splits · E/Esc closes  "
+        } else if player.flying {
             text = "  ✈ SPECTATOR — Space up · Shift down  " + text
         }
-        if !input.captured {
+        if !input.captured && gui.screen == nil {
             text = "  ▸ Click to capture mouse (Esc releases)  " + text
         }
         if hud.stringValue != text {

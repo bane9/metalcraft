@@ -101,6 +101,20 @@ enum Mesher {
             return SIMD2(4, 4)
         case .cactus:
             return (dir == 2 || dir == 3) ? SIMD2(5, 4) : SIMD2(6, 4)
+        case .planks: return SIMD2(4, 0)
+        case .cobblestone: return SIMD2(0, 1)
+        case .coalOre: return SIMD2(2, 2)
+        case .ironOre: return SIMD2(1, 2)
+        case .goldOre: return SIMD2(0, 2)
+        case .diamondOre: return SIMD2(2, 3)
+        case .craftingTable:
+            if dir == 2 { return SIMD2(11, 2) }
+            if dir == 3 { return SIMD2(4, 0) }
+            return (dir == 4 || dir == 5) ? SIMD2(11, 3) : SIMD2(12, 3)
+        case .furnace, .furnaceLit:
+            if dir == 2 || dir == 3 { return SIMD2(14, 3) }
+            if dir == 5 { return b == .furnaceLit ? SIMD2(13, 3) : SIMD2(12, 2) }
+            return SIMD2(13, 2)
         default: return SIMD2(0, 0)
         }
     }
