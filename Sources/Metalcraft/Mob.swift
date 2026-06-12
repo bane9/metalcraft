@@ -84,6 +84,8 @@ final class Mob {
     var hurtTime: Float = 0 // red-flash countdown after taking a hit
     var dead = false
     var deathTime: Float = 0 // drives the death roll, then despawn
+    var attackCooldown: Float = 0 // melee rate limit for hostiles
+    var fuse: Float = -1 // creeper: seconds until the bang once lit
 
     private var targetYaw: Float
     private var walking = false
@@ -116,9 +118,10 @@ final class Mob {
         }
     }
 
-    func update(dt: Float, world: World) {
+    func update(dt: Float, world: World, playerPos: SIMD3<Float>? = nil) {
         age += dt
         hurtTime = max(0, hurtTime - dt)
+        attackCooldown = max(0, attackCooldown - dt)
 
         if dead {
             // ragdoll: no steering, just friction and gravity until despawn
@@ -145,6 +148,12 @@ final class Mob {
                 walking = false
                 stateTimer = Float.random(in: 1...4)
             }
+        }
+
+        // hostile mobs lock onto a nearby player instead of wandering
+        if kind.hostile, let p = playerPos, simd_distance(p, pos) < 16 {
+            targetYaw = atan2(p.x - pos.x, -(p.z - pos.z))
+            walking = simd_length(SIMD2(p.x - pos.x, p.z - pos.z)) > 1.0
         }
 
         // turn smoothly toward the chosen heading

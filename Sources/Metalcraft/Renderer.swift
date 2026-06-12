@@ -356,6 +356,9 @@ final class Renderer: NSObject, MTKViewDelegate {
         remeshDirtyChunks()
         streamMeshes()
 
+        // death: everything restarts with a fresh world
+        if player.health <= 0 { resetWorld() }
+
         // camera: player eye, pulled back in third person, or swaying with
         // the walk cycle in first person
         var eye = player.eye
@@ -615,6 +618,14 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         }
 
+        // red vignette while the last hit still stings
+        if player.hurtFlash > 0 {
+            enc.setDepthStencilState(depthOff)
+            let b = view.bounds.size
+            drawSolidQuad(enc, ndcRect(0, 0, b.width, b.height, b),
+                          SIMD4(0.7, 0, 0, player.hurtFlash))
+        }
+
         drawHotbar(enc, view: view, baseUniforms: uniforms)
 
         if gui.screen == nil {
@@ -791,6 +802,40 @@ final class Renderer: NSObject, MTKViewDelegate {
             guard let stack = inventory.slots[i] else { continue }
             drawItemIcon(enc, item: stack.item, center: hotbarSlotCenter(i, bounds),
                          size: 16 * uiScale, bounds: bounds, baseUniforms: baseUniforms)
+        }
+
+        // health: ten heart containers above the hotbar, half-heart steps
+        let icons = texture("icons", "gui")
+        for i in 0..<10 {
+            let rect = CGRect(x: o.x + CGFloat(i) * 8 * uiScale,
+                              y: o.y + 24 * uiScale,
+                              width: 9 * uiScale, height: 9 * uiScale)
+            drawUIQuad(enc, texture: icons, rect: rect,
+                       srcX: 16, srcY: 0, srcW: 9, srcH: 9, bounds: bounds)
+            let hp = player.health - Float(i * 2)
+            if hp >= 2 {
+                drawUIQuad(enc, texture: icons, rect: rect,
+                           srcX: 52, srcY: 0, srcW: 9, srcH: 9, bounds: bounds)
+            } else if hp >= 1 {
+                drawUIQuad(enc, texture: icons, rect: rect,
+                           srcX: 61, srcY: 0, srcW: 9, srcH: 9, bounds: bounds)
+            }
+        }
+
+        // air bubbles over the hotbar's right end while submerged, right to
+        // left like the real game; the draining bubble pops before it goes
+        if player.air < 10 {
+            let bubbles = Int(player.air.rounded(.up))
+            let frac = player.air - Float(Int(player.air))
+            for i in 0..<max(bubbles, 0) {
+                let rect = CGRect(x: o.x + 182 * uiScale - CGFloat(i + 1) * 8 * uiScale - uiScale,
+                                  y: o.y + 24 * uiScale,
+                                  width: 9 * uiScale, height: 9 * uiScale)
+                let popping = i == bubbles - 1 && frac > 0 && frac < 0.25
+                drawUIQuad(enc, texture: icons, rect: rect,
+                           srcX: popping ? 25 : 16, srcY: 18, srcW: 9, srcH: 9,
+                           bounds: bounds)
+            }
         }
     }
 
@@ -1130,7 +1175,30 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     private func updateMobs(dt: Float) {
-        for mob in mobs { mob.update(dt: dt, world: world) }
+        for mob in mobs { mob.update(dt: dt, world: world, playerPos: player.pos) }
+
+        for mob in mobs where mob.kind.hostile && !mob.dead {
+            if mob.kind == .creeper {
+                creeperTick(mob, dt: dt)
+            } else if mob.attackCooldown <= 0 {
+                // zombie melee: a hit whenever the boxes touch
+                let dh = simd_length(SIMD2(mob.pos.x - player.pos.x,
+                                           mob.pos.z - player.pos.z))
+                let overlapsV = mob.pos.y < player.pos.y + Player.height
+                    && mob.pos.y + mob.kind.height > player.pos.y
+                if dh < mob.kind.halfWidth + Player.halfWidth + 0.35 && overlapsV {
+                    mob.attackCooldown = 1
+                    if player.hurt(4) {
+                        var kb = SIMD3(player.pos.x - mob.pos.x, 0,
+                                       player.pos.z - mob.pos.z)
+                        if simd_length_squared(kb) > 1e-6 { kb = simd_normalize(kb) }
+                        player.vel += kb * 7
+                        player.vel.y = max(player.vel.y, 4.5)
+                    }
+                }
+            }
+        }
+
         mobs.removeAll {
             ($0.dead && $0.deathTime > 1.6)
                 || simd_distance($0.pos, player.pos) > 110
@@ -1141,6 +1209,60 @@ final class Renderer: NSObject, MTKViewDelegate {
         guard mobSpawnTimer <= 0 else { return }
         mobSpawnTimer = 0.4
         if mobs.count < 26 { attemptMobSpawn() }
+    }
+
+    /// Creeper fuse: lights within striking range, pulses red while burning,
+    /// and goes off unless the player breaks away.
+    private func creeperTick(_ mob: Mob, dt: Float) {
+        let d = simd_distance(mob.pos, player.pos)
+        if mob.fuse >= 0 {
+            mob.fuse -= dt
+            mob.hurtTime = mob.fuse.truncatingRemainder(dividingBy: 0.3) > 0.15 ? 0.3 : 0
+            if d > 7 {
+                mob.fuse = -1 // the player got away
+                mob.hurtTime = 0
+            } else if mob.fuse <= 0 {
+                explode(at: mob.pos + SIMD3(0, 0.8, 0))
+                mob.dead = true
+                mob.deathTime = 10 // no corpse roll: removed this frame
+            }
+        } else if d < 3 {
+            mob.fuse = 1.5 // sssss...
+        }
+    }
+
+    /// Creeper blast: carves a sphere out of the terrain and hurts anything
+    /// nearby with linear distance falloff.
+    private func explode(at c: SIMD3<Float>) {
+        let radius: Float = 2.8
+        let r = Int(radius.rounded(.up))
+        let bx = Int(c.x.rounded(.down)), by = Int(c.y.rounded(.down)), bz = Int(c.z.rounded(.down))
+        for y in (by - r)...(by + r) {
+            for z in (bz - r)...(bz + r) {
+                for x in (bx - r)...(bx + r) {
+                    let center = SIMD3<Float>(Float(x) + 0.5, Float(y) + 0.5, Float(z) + 0.5)
+                    guard simd_distance(center, c) <= radius else { continue }
+                    let b = world.block(x, y, z)
+                    guard b != .air && b != .bedrock && !b.isWater else { continue }
+                    world.setBlock(x, y, z, .air)
+                }
+            }
+        }
+
+        let pd = simd_distance(player.pos + SIMD3(0, 0.9, 0), c)
+        if pd < 6, player.hurt(((1 - pd / 6) * 16).rounded(.down)) {
+            var kb = (player.pos + SIMD3(0, 0.9, 0)) - c
+            if simd_length_squared(kb) > 1e-4 { kb = simd_normalize(kb) }
+            player.vel += kb * 9
+            player.vel.y = max(player.vel.y, 5)
+        }
+        for m in mobs where !m.dead && m.kind != .creeper {
+            let md = simd_distance(m.pos + SIMD3(0, m.kind.height / 2, 0), c)
+            guard md < 6 else { continue }
+            var dir = SIMD3(m.pos.x - c.x, 0, m.pos.z - c.z)
+            if simd_length_squared(dir) > 1e-6 { dir = simd_normalize(dir) }
+            m.hurt(damage: (1 - md / 6) * 16, direction: dir)
+        }
     }
 
     /// One spawn attempt per tick: pick a random surface spot near the player

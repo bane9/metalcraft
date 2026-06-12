@@ -60,6 +60,15 @@ final class Player {
     var flying = false // spectator: no gravity + free vertical movement
     private var hitWall = false
 
+    // health: 20 half-hearts like the real game. Damage comes from falls,
+    // hostile mobs and drowning; spectators are invulnerable.
+    var health: Float = 20
+    var hurtFlash: Float = 0 // drives the red damage vignette
+    private var hurtCooldown: Float = 0 // brief invulnerability between hits
+    private var fallDistance: Float = 0
+    private(set) var air: Float = 10 // seconds of breath under water
+    private var drownTick: Float = 0
+
     // walk-cycle phase and 0-1 intensity: drives the first-person view bob
     // and the third-person model's limb swing
     var bobPhase: Float = 0
@@ -78,6 +87,23 @@ final class Player {
         yaw = 0
         pitch = -0.15
         flying = false
+        health = 20
+        hurtFlash = 0
+        hurtCooldown = 0
+        fallDistance = 0
+        air = 10
+        drownTick = 0
+    }
+
+    /// Applies damage unless flying (spectator) or still invulnerable from
+    /// the last hit. Returns whether the hit landed (gates knockback).
+    @discardableResult
+    func hurt(_ damage: Float) -> Bool {
+        guard !flying, hurtCooldown <= 0, damage >= 1 else { return false }
+        health -= damage
+        hurtCooldown = 0.5
+        hurtFlash = 0.45
+        return true
     }
 
     func look(dx: Float, dy: Float) {
@@ -88,6 +114,9 @@ final class Player {
     }
 
     func update(dt: Float, input: Input, world: World) {
+        hurtCooldown = max(0, hurtCooldown - dt)
+        hurtFlash = max(0, hurtFlash - dt)
+
         let fwd = SIMD3<Float>(sin(yaw), 0, -cos(yaw))
         let right = SIMD3<Float>(cos(yaw), 0, sin(yaw))
         var wishDir = SIMD3<Float>.zero
@@ -109,6 +138,8 @@ final class Player {
             move(axis: 0, by: vel.x * dt, world: world)
             move(axis: 2, by: vel.z * dt, world: world)
             onGround = false
+            fallDistance = 0
+            air = 10
             bobAmount *= exp(-6 * dt)
             if pos.y < -64 { spawn(in: world) }
             return
@@ -119,6 +150,13 @@ final class Player {
                                      Int((pos.y + 0.9).rounded(.down)),
                                      Int(pos.z.rounded(.down)))
         let inWater = waistBlock.isWater
+
+        // water breaks a fall completely; otherwise track the drop height
+        if inWater {
+            fallDistance = 0
+        } else if vel.y < 0 {
+            fallDistance -= vel.y * dt
+        }
 
         // Horizontal movement: friction first, then capped acceleration
         // toward the wish direction — momentum instead of teleport-velocity.
@@ -168,12 +206,35 @@ final class Player {
             vel.y = max(vel.y, 8.0)
         }
 
+        // landing: falls past 3 blocks hurt, one half-heart per extra block
+        if onGround {
+            if fallDistance > 4 { hurt((fallDistance - 3).rounded(.down)) }
+            fallDistance = 0
+        }
+
+        // drowning: ten seconds of breath, then steady damage
+        let eyeBlock = world.block(Int(eye.x.rounded(.down)),
+                                   Int(eye.y.rounded(.down)),
+                                   Int(eye.z.rounded(.down)))
+        if eyeBlock.isWater {
+            air -= dt
+            drownTick -= dt
+            if air <= 0 && drownTick <= 0 {
+                drownTick = 1
+                health -= 2 // ignores i-frames: water is patient
+                hurtFlash = 0.45
+            }
+        } else {
+            air = 10
+            drownTick = 0
+        }
+
         let hspeed = simd_length(SIMD2(vel.x, vel.z))
         let target = onGround ? min(hspeed / 4.8, 1.2) : 0
         bobAmount += (target - bobAmount) * min(1, 8 * dt)
         bobPhase += hspeed * dt * 2.2
 
-        if pos.y < -12 { spawn(in: world) }
+        if pos.y < -12 { health = 0 } // the void is lethal
     }
 
     var aabb: (min: SIMD3<Float>, max: SIMD3<Float>) {
