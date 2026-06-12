@@ -9,7 +9,9 @@ struct Uniforms {
     var sunDir: SIMD4<Float>
     var fogColor: SIMD4<Float>
     var fogParams: SIMD4<Float>   // x = fog start, y = fog end
-    var alphaParams: SIMD4<Float> // x = alpha multiplier, y = discard threshold
+    var alphaParams: SIMD4<Float> // x = alpha multiplier, y = discard threshold, z = hurt
+    var lightParams: SIMD4<Float> // x = day factor, y = mode (0 vertex/1 entity/2 full),
+                                  // z/w = entity sky/block light 0-1
 }
 
 struct LineUniforms {
@@ -54,6 +56,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     let linePipeline: MTLRenderPipelineState
     let uiPipeline: MTLRenderPipelineState
     let uiTexPipeline: MTLRenderPipelineState
+    let cloudPipeline: MTLRenderPipelineState
     let depthOn: MTLDepthStencilState
     let depthReadOnly: MTLDepthStencilState
     let depthOff: MTLDepthStencilState
@@ -107,12 +110,19 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var pendingGen = Set<ChunkCoord>()
     private var pendingMesh = Set<ChunkCoord>()
     private var dirtyWhileMeshing = Set<ChunkCoord>()
+    private var discardInFlight = Set<ChunkCoord>() // superseded by an urgent sync remesh
     private var epoch = 0 // bumped on world reset; stale results are dropped
     private let maxGenJobs = max(2, ProcessInfo.processInfo.activeProcessorCount - 2)
     private let maxMeshJobs = 6
 
-    private let skyColor = SIMD4<Float>(0.55, 0.74, 0.95, 1)
     private let waterFogColor = SIMD4<Float>(0.07, 0.20, 0.40, 1)
+
+    // day/night cycle: one full day every 10 minutes, starting mid-morning
+    private let dayLength: Float = 600
+    private var timeOfDay: Float = 0.35 // 0.25 = sunrise, 0.5 = noon, 0.75 = sunset
+    private var cloudOffset: Float = 0
+    private let starBuffer: MTLBuffer
+    private let starVertexCount: Int
 
     init(device: MTLDevice, view: MTKView, input: Input) {
         self.device = device
@@ -144,6 +154,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         linePipeline = makePipeline(vertex: "line_vertex", fragment: "line_fragment", blended: false)
         uiPipeline = makePipeline(vertex: "line_vertex", fragment: "line_fragment", blended: true)
         uiTexPipeline = makePipeline(vertex: "ui_vertex", fragment: "ui_fragment", blended: true)
+        cloudPipeline = makePipeline(vertex: "cloud_vertex", fragment: "cloud_fragment", blended: true)
 
         func makeDepthState(compare: MTLCompareFunction, write: Bool) -> MTLDepthStencilState {
             let d = MTLDepthStencilDescriptor()
@@ -187,6 +198,29 @@ final class Renderer: NSObject, MTKViewDelegate {
             0, 0, 0, 1, 1, 0, 0, 1, 0,
         ]
         quadBuffer = device.makeBuffer(bytes: quad, length: quad.count * 4)!
+
+        // star field: small quads scattered on the celestial sphere, rotated
+        // with the sun so they wheel across the night sky like beta's
+        var starVerts: [Float] = []
+        for _ in 0..<600 {
+            var d = SIMD3<Float>.zero
+            repeat {
+                d = SIMD3(Float.random(in: -1...1), Float.random(in: -1...1),
+                          Float.random(in: -1...1))
+            } while simd_length_squared(d) > 1 || simd_length_squared(d) < 0.01
+            d = simd_normalize(d)
+            let size = Float.random(in: 0.5...1.4)
+            let ref: SIMD3<Float> = abs(d.y) < 0.9 ? SIMD3(0, 1, 0) : SIMD3(1, 0, 0)
+            let t1 = simd_normalize(simd_cross(d, ref)) * size
+            let t2 = simd_normalize(simd_cross(d, t1)) * size
+            let c = d * 400
+            let corners = [c - t1 - t2, c + t1 - t2, c + t1 + t2, c - t1 + t2]
+            for i in [0, 1, 2, 0, 2, 3] {
+                starVerts.append(contentsOf: [corners[i].x, corners[i].y, corners[i].z])
+            }
+        }
+        starBuffer = device.makeBuffer(bytes: starVerts, length: starVerts.count * 4)!
+        starVertexCount = starVerts.count / 3
 
         func sortedOffsets(radius: Int) -> [(Int, Int)] {
             var offs: [(Int, Int)] = []
@@ -324,10 +358,30 @@ final class Renderer: NSObject, MTKViewDelegate {
             eye += SIMD3(0, abs(cos(player.bobPhase)) * b, 0)
                 + right * sin(player.bobPhase) * b * 0.5
         }
+        // beta celestial math: a cosine over the day drives everything.
+        // dayBright is beta's "celestial brightness" (0 night, 1 day); the
+        // shader subtracts skyDarken whole light levels like beta did
+        // (midnight surface sits at level 4).
+        timeOfDay = (timeOfDay + dt / dayLength).truncatingRemainder(dividingBy: 1)
+        cloudOffset += dt * 0.6
+        let sunAngle = (timeOfDay - 0.25) * 2 * .pi
+        let sunHeight = sin(sunAngle)
+        let sunDir = simd_normalize(SIMD3<Float>(cos(sunAngle), sin(sunAngle), 0.18))
+        let dayBright = max(0, min(1, cos((timeOfDay - 0.5) * 2 * .pi) * 2 + 0.5))
+        let skyDarken = (1 - dayBright) * 11
+
+        // beta fog/horizon color, with a faint warm band at sunrise/sunset
+        var skyc = SIMD3<Float>(0.753, 0.847, 1.0)
+            * SIMD3(dayBright * 0.94 + 0.06, dayBright * 0.94 + 0.06, dayBright * 0.91 + 0.09)
+        let dusk = exp(-(sunHeight / 0.13) * (sunHeight / 0.13))
+        skyc = simd_mix(skyc, SIMD3(0.95, 0.50, 0.25), SIMD3(repeating: dusk * 0.30))
+
         let eyeInWater = world.block(Int(eye.x.rounded(.down)),
                                      Int(eye.y.rounded(.down)),
                                      Int(eye.z.rounded(.down))).isWater
-        let fogColor = eyeInWater ? waterFogColor : skyColor
+        let fogColor = eyeInWater
+            ? waterFogColor * (0.25 + 0.75 * dayBright)
+            : SIMD4(skyc, 1)
         let fogRange: SIMD2<Float> = eyeInWater
             ? SIMD2(4, 28)
             : SIMD2(Float(meshRadius * 16) - 54, Float(meshRadius * 16) - 4)
@@ -349,10 +403,47 @@ final class Renderer: NSObject, MTKViewDelegate {
             viewProj: viewProj,
             model: matrix_identity_float4x4,
             camPos: SIMD4(eye, 0),
-            sunDir: SIMD4(simd_normalize(SIMD3<Float>(0.45, 0.9, 0.25)), 0),
+            sunDir: SIMD4(sunDir, 0),
             fogColor: fogColor,
             fogParams: SIMD4(fogRange.x, fogRange.y, 0, 0),
-            alphaParams: SIMD4(1.0, 0.5, 0, 0))
+            alphaParams: SIMD4(1.0, 0.5, 0, 0),
+            lightParams: SIMD4(skyDarken, 0, 0, 0))
+
+        // stars, sun and moon: drawn first so terrain occludes them
+        if !eyeInWater {
+            enc.setRenderPipelineState(uiPipeline)
+            enc.setDepthStencilState(depthOff)
+
+            let starAlpha = (1 - dayBright) * (1 - dayBright) * 0.75
+            if starAlpha > 0.02 {
+                var su = LineUniforms(
+                    mvp: viewProj * translationMatrix(eye) * rotationZMatrix(sunAngle),
+                    color: SIMD4(1, 1, 1, starAlpha))
+                enc.setVertexBuffer(starBuffer, offset: 0, index: 0)
+                enc.setVertexBytes(&su, length: MemoryLayout<LineUniforms>.stride, index: 1)
+                enc.setFragmentBytes(&su, length: MemoryLayout<LineUniforms>.stride, index: 1)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: starVertexCount)
+            }
+
+            enc.setVertexBuffer(quadBuffer, offset: 0, index: 0)
+            func skyQuad(_ dir: SIMD3<Float>, _ size: Float, _ color: SIMD4<Float>) {
+                guard dir.y > -0.3 else { return }
+                let right = simd_normalize(simd_cross(SIMD3<Float>(0, 0, 1), dir))
+                let up = simd_cross(dir, right)
+                var m = matrix_identity_float4x4
+                m.columns.0 = SIMD4(right * size, 0)
+                m.columns.1 = SIMD4(up * size, 0)
+                m.columns.2 = SIMD4(dir, 0)
+                m.columns.3 = SIMD4(eye + dir * 420, 1)
+                var lu = LineUniforms(mvp: viewProj * m * translationMatrix(SIMD3(-0.5, -0.5, 0)),
+                                      color: color)
+                enc.setVertexBytes(&lu, length: MemoryLayout<LineUniforms>.stride, index: 1)
+                enc.setFragmentBytes(&lu, length: MemoryLayout<LineUniforms>.stride, index: 1)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+            }
+            skyQuad(sunDir, 52, SIMD4(1.0, 0.93, 0.72, 1))
+            skyQuad(-sunDir, 32, SIMD4(0.88, 0.92, 1.0, 0.9))
+        }
 
         // opaque terrain (leaf holes via alpha discard)
         enc.setRenderPipelineState(blockPipeline)
@@ -374,14 +465,19 @@ final class Renderer: NSObject, MTKViewDelegate {
             var iu = uniforms
             iu.model = translationMatrix(item.pos + SIMD3(0, bob, 0))
                 * rotationYMatrix(item.age * 1.6)
+            let l = world.lightAt(Int(item.pos.x.rounded(.down)),
+                                  Int((item.pos.y + 0.2).rounded(.down)),
+                                  Int(item.pos.z.rounded(.down)))
+            iu.lightParams = SIMD4(skyDarken, 1, l.x, l.y)
             let mesh: CubeMesh
-            if let b = item.item.asBlock {
+            if let b = item.item.asBlock, b != .torch {
                 iu.model *= scaleMatrix(SIMD3(repeating: 0.25))
                 mesh = cubeMesh(for: b, icon: false)
                 enc.setFragmentTexture(atlas, index: 0)
             } else {
                 mesh = spriteMesh(for: item.item)
-                enc.setFragmentTexture(texture("items", "gui"), index: 0)
+                enc.setFragmentTexture(item.item == .block(.torch) ? atlas : texture("items", "gui"),
+                                       index: 0)
             }
             enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
             enc.setVertexBytes(&iu, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -404,8 +500,13 @@ final class Renderer: NSObject, MTKViewDelegate {
             let flap: Float = mob.kind == .chicken && !mob.onGround && !mob.dead
                 ? 1.0 + sin(mob.age * 30) * 0.8 : 0
             let hurt: Float = mob.dead ? 0.65 : (mob.hurtTime > 0 ? 0.7 : 0)
+            let l = world.lightAt(Int(mob.pos.x.rounded(.down)),
+                                  Int((mob.pos.y + mob.kind.height * 0.6).rounded(.down)),
+                                  Int(mob.pos.z.rounded(.down)))
+            var mu = uniforms
+            mu.lightParams = SIMD4(skyDarken, 1, l.x, l.y)
             drawModel(enc, model: model(for: mob.kind), entity: entity,
-                      uniforms: uniforms, swing: mob.limbSwing,
+                      uniforms: mu, swing: mob.limbSwing,
                       amount: mob.swingAmount, headPitch: 0, flap: flap, hurt: hurt)
         }
 
@@ -414,8 +515,13 @@ final class Renderer: NSObject, MTKViewDelegate {
             let bob = abs(cos(player.bobPhase)) * 0.06 * min(player.bobAmount, 1)
             let entity = translationMatrix(player.pos + SIMD3(0, bob, 0))
                 * rotationYMatrix(-player.yaw)
+            let l = world.lightAt(Int(player.pos.x.rounded(.down)),
+                                  Int(player.eye.y.rounded(.down)),
+                                  Int(player.pos.z.rounded(.down)))
+            var pu = uniforms
+            pu.lightParams = SIMD4(skyDarken, 1, l.x, l.y)
             drawModel(enc, model: playerModel, entity: entity,
-                      uniforms: uniforms, swing: player.bobPhase,
+                      uniforms: pu, swing: player.bobPhase,
                       amount: min(player.bobAmount, 1.2),
                       headPitch: player.pitch, flap: 0)
         }
@@ -435,7 +541,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         // water: blended, depth-tested but not depth-written
         var waterUniforms = uniforms
-        waterUniforms.alphaParams = SIMD4(1.35, 0.05, 0, 0)
+        waterUniforms.alphaParams = SIMD4(0.72, 0.05, 0, 0)
         enc.setRenderPipelineState(waterPipeline)
         enc.setDepthStencilState(depthReadOnly)
         enc.setVertexBytes(&waterUniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -445,6 +551,29 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.drawIndexedPrimitives(type: .triangle, indexCount: mesh.waterIndexCount,
                                       indexType: .uint32, indexBuffer: mesh.waterIndexBuffer!,
                                       indexBufferOffset: 0)
+        }
+
+        // beta cloud layer: flat texture plane at y=108 drifting east, one
+        // cloud pixel = 12 blocks, tinted down with the daylight
+        if !eyeInWater {
+            let reach: Float = 768
+            let cy: Float = 108
+            let scale: Float = 12 * 256
+            func cv(_ x: Float, _ z: Float) -> [Float] {
+                [x, cy, z, (x + cloudOffset) / scale, z / scale]
+            }
+            let verts = cv(eye.x - reach, eye.z - reach) + cv(eye.x + reach, eye.z - reach)
+                + cv(eye.x + reach, eye.z + reach) + cv(eye.x - reach, eye.z - reach)
+                + cv(eye.x + reach, eye.z + reach) + cv(eye.x - reach, eye.z + reach)
+            let cb = dayBright * 0.9 + 0.1
+            var cu = LineUniforms(mvp: viewProj, color: SIMD4(cb, cb, cb, 0.8))
+            enc.setRenderPipelineState(cloudPipeline)
+            enc.setDepthStencilState(depthReadOnly)
+            enc.setFragmentTexture(texture("clouds", "environment"), index: 0)
+            enc.setVertexBytes(verts, length: verts.count * 4, index: 0)
+            enc.setVertexBytes(&cu, length: MemoryLayout<LineUniforms>.stride, index: 1)
+            enc.setFragmentBytes(&cu, length: MemoryLayout<LineUniforms>.stride, index: 1)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         }
 
         drawHotbar(enc, view: view, baseUniforms: uniforms)
@@ -552,7 +681,13 @@ final class Renderer: NSObject, MTKViewDelegate {
     private func drawItemIcon(_ enc: MTLRenderCommandEncoder, item: Item,
                               center: CGPoint, size: CGFloat,
                               bounds: CGSize, baseUniforms: Uniforms) {
-        if let b = item.asBlock {
+        if item == .block(.torch) {
+            // torches draw flat from their terrain tile, like the real game
+            drawUIQuad(enc, texture: atlas,
+                       rect: CGRect(x: center.x - size / 2, y: center.y - size / 2,
+                                    width: size, height: size),
+                       srcX: 0, srcY: 5 * 16, srcW: 16, srcH: 16, bounds: bounds)
+        } else if let b = item.asBlock {
             enc.setRenderPipelineState(blockPipeline)
             enc.setFragmentTexture(atlas, index: 0)
             var iu = baseUniforms
@@ -560,6 +695,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             iu.camPos = SIMD4(0, 0, 0, 0)
             iu.fogParams = SIMD4(1e8, 2e8, 0, 0) // no fog on UI
             iu.alphaParams = SIMD4(1.0, 0.5, 0, 0)
+            iu.lightParams = SIMD4(1, 2, 0, 0) // full bright
             let cx = Float(center.x / bounds.width) * 2 - 1
             let cy = Float(center.y / bounds.height) * 2 - 1
             let sy = Float(size * 0.36 / bounds.height) * 2
@@ -715,6 +851,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         u.sunDir = SIMD4(simd_normalize(SIMD3<Float>(0.3, 0.6, 0.9)), 0)
         u.fogParams = SIMD4(1e8, 2e8, 0, 0)
         u.alphaParams = SIMD4(1.0, 0.5, 0, 0)
+        u.lightParams = SIMD4(1, 2, 0, 0) // full bright
 
         enc.setRenderPipelineState(blockPipeline)
         enc.setDepthStencilState(depthOn)
@@ -809,19 +946,19 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
-    /// Flat double-sided quad showing an items.png sprite, for dropped
-    /// materials like coal or ingots.
+    /// Flat double-sided quad showing a 16px sprite tile, for dropped
+    /// materials like coal or ingots (and torches, which use the atlas).
     private func spriteMesh(for item: Item) -> CubeMesh {
         if let cached = spriteMeshCache[item] { return cached }
-        let t = item.sprite ?? SIMD2(0, 0)
+        let t = item == .block(.torch) ? SIMD2<Float>(0, 5) : (item.sprite ?? SIMD2(0, 0))
         let u0 = (t.x * 16 + 0.1) / 256, u1 = (t.x * 16 + 15.9) / 256
         let v0 = (t.y * 16 + 0.1) / 256, v1 = (t.y * 16 + 15.9) / 256
         let s: Float = 0.26
         let verts: [Float] = [
-            -s, -s, 0, 0, 0, 1, u0, v1, 1, 1, 1,
-             s, -s, 0, 0, 0, 1, u1, v1, 1, 1, 1,
-             s,  s, 0, 0, 0, 1, u1, v0, 1, 1, 1,
-            -s,  s, 0, 0, 0, 1, u0, v0, 1, 1, 1,
+            -s, -s, 0, 0, 0, 1, u0, v1, 1, 1, 1, 15, 0,
+             s, -s, 0, 0, 0, 1, u1, v1, 1, 1, 1, 15, 0,
+             s,  s, 0, 0, 0, 1, u1, v0, 1, 1, 1, 15, 0,
+            -s,  s, 0, 0, 0, 1, u0, v0, 1, 1, 1, 15, 0,
         ]
         let indices: [UInt32] = [0, 1, 2, 0, 2, 3]
         let mesh = CubeMesh(
@@ -1000,10 +1137,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         for m in built {
             pendingMesh.remove(m.coord)
             guard m.epoch == epoch else { continue }
-            if dirtyWhileMeshing.remove(m.coord) != nil {
-                rebuildMesh(m.coord) // edited while the job ran; rebuild fresh
-            } else {
+            if discardInFlight.remove(m.coord) == nil {
                 meshes[m.coord] = m.mesh
+            }
+            if dirtyWhileMeshing.remove(m.coord) != nil {
+                submitMeshJob(m.coord) // edited while the job ran; refresh again
             }
         }
     }
@@ -1060,23 +1198,56 @@ final class Renderer: NSObject, MTKViewDelegate {
             : device.makeBuffer(bytes: geo.waterIndices, length: geo.waterIndices.count * 4)
     }
 
-    private func rebuildMesh(_ c: ChunkCoord) {
-        let geo = Mesher.buildChunk(world: world, coord: c)
-        let mesh = meshes[c] ?? ChunkMesh()
-        uploadGeometry(geo, into: mesh)
-        meshes[c] = mesh
+    /// Mesh + light job for one chunk; results land in integrateFinishedWork.
+    private func submitMeshJob(_ c: ChunkCoord) {
+        pendingMesh.insert(c)
+        let snapshot = ChunkSnapshot(world: world, center: c)
+        let ep = epoch
+        workQueue.async { [weak self] in
+            guard let self else { return }
+            let geo = Mesher.buildChunk(snapshot: snapshot, coord: c)
+            let mesh = ChunkMesh()
+            self.uploadGeometry(geo, into: mesh)
+            self.resultLock.lock()
+            self.finishedMeshes.append((ep, c, mesh))
+            self.resultLock.unlock()
+        }
     }
 
-    /// Edits remesh synchronously for instant feedback (it's 1-3 chunks). If
-    /// the chunk's first mesh is still being built in the background, remember
-    /// the edit so the stale result gets rebuilt when it lands.
+    /// Instant remesh of the chunks whose geometry a player edit visibly
+    /// changed: the edited cell's chunk plus border neighbors. The wider 3×3
+    /// light refresh stays on the background queue, where the few-ms latency
+    /// is invisible. Any in-flight result for these chunks is now stale and
+    /// gets dropped on arrival.
+    private func remeshUrgent(_ x: Int, _ z: Int) {
+        let cc = World.chunkCoord(blockX: x, blockZ: z)
+        var coords = [cc]
+        let lx = x & 15, lz = z & 15
+        if lx == 0 { coords.append(ChunkCoord(x: cc.x - 1, z: cc.z)) }
+        if lx == 15 { coords.append(ChunkCoord(x: cc.x + 1, z: cc.z)) }
+        if lz == 0 { coords.append(ChunkCoord(x: cc.x, z: cc.z - 1)) }
+        if lz == 15 { coords.append(ChunkCoord(x: cc.x, z: cc.z + 1)) }
+        for c in coords where meshes[c] != nil && neighborsGenerated(c) {
+            if pendingMesh.contains(c) { discardInFlight.insert(c) }
+            let snapshot = ChunkSnapshot(world: world, center: c)
+            let geo = Mesher.buildChunk(snapshot: snapshot, coord: c)
+            let mesh = meshes[c] ?? ChunkMesh()
+            uploadGeometry(geo, into: mesh)
+            meshes[c] = mesh
+            world.dirtyChunks.remove(c) // already fresh; skip the background pass
+        }
+    }
+
+    /// Edits remesh through the background pipeline (lighting makes a rebuild
+    /// a few ms, too slow for the render loop). A chunk already being meshed
+    /// is remembered and refreshed when the stale result lands.
     private func remeshDirtyChunks() {
         guard !world.dirtyChunks.isEmpty else { return }
         for c in world.dirtyChunks {
-            if meshes[c] != nil && neighborsGenerated(c) {
-                rebuildMesh(c)
-            } else if pendingMesh.contains(c) {
+            if pendingMesh.contains(c) {
                 dirtyWhileMeshing.insert(c)
+            } else if meshes[c] != nil && neighborsGenerated(c) {
+                submitMeshJob(c)
             }
         }
         world.dirtyChunks.removeAll()
@@ -1088,18 +1259,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             for (dx, dz) in meshOffsets {
                 let c = ChunkCoord(x: pc.x + dx, z: pc.z + dz)
                 guard meshes[c] == nil, !pendingMesh.contains(c), neighborsGenerated(c) else { continue }
-                pendingMesh.insert(c)
-                let snapshot = ChunkSnapshot(world: world, center: c)
-                let ep = epoch
-                workQueue.async { [weak self] in
-                    guard let self else { return }
-                    let geo = Mesher.buildChunk(world: snapshot, coord: c)
-                    let mesh = ChunkMesh()
-                    self.uploadGeometry(geo, into: mesh)
-                    self.resultLock.lock()
-                    self.finishedMeshes.append((ep, c, mesh))
-                    self.resultLock.unlock()
-                }
+                submitMeshJob(c)
                 if pendingMesh.count >= maxMeshJobs { break }
             }
         }
@@ -1165,6 +1325,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         let b = world.block(x, y, z)
         guard b != .air && b != .bedrock && !b.isWater else { return }
         world.setBlock(x, y, z, .air)
+        remeshUrgent(x, z)
         let center = SIMD3<Float>(Float(x) + 0.5, Float(y) + 0.4, Float(z) + 0.5)
         // a mined furnace spills whatever it held
         if b == .furnace || b == .furnaceLit,
@@ -1202,16 +1363,22 @@ final class Renderer: NSObject, MTKViewDelegate {
         let target = world.block(x, y, z)
         guard target == .air || target.isWater else { return }
 
-        // don't place a block inside the player
-        let bmin = SIMD3<Float>(Float(x), Float(y), Float(z))
-        let bmax = bmin + SIMD3<Float>(1, 1, 1)
-        let (pmin, pmax) = player.aabb
-        let overlaps = pmin.x < bmax.x && pmax.x > bmin.x
-            && pmin.y < bmax.y && pmax.y > bmin.y
-            && pmin.z < bmax.z && pmax.z > bmin.z
-        guard !overlaps || player.flying else { return }
+        if block == .torch {
+            // torches need solid ground and have no collision box
+            guard world.isSolid(x, y - 1, z) else { return }
+        } else {
+            // don't place a block inside the player
+            let bmin = SIMD3<Float>(Float(x), Float(y), Float(z))
+            let bmax = bmin + SIMD3<Float>(1, 1, 1)
+            let (pmin, pmax) = player.aabb
+            let overlaps = pmin.x < bmax.x && pmax.x > bmin.x
+                && pmin.y < bmax.y && pmax.y > bmin.y
+                && pmin.z < bmax.z && pmax.z > bmin.z
+            guard !overlaps || player.flying else { return }
+        }
 
         world.setBlock(x, y, z, block)
+        remeshUrgent(x, z)
         _ = inventory.consumeSelected()
     }
 

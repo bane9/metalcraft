@@ -3,13 +3,30 @@ import simd
 enum Block: UInt8 {
     case air = 0, grass, dirt, stone, sand, wood, leaves, bedrock, snow, cactus
     case planks = 10, cobblestone, coalOre, ironOre, goldOre, diamondOre, redstoneOre, gravel
-    case craftingTable = 20, furnace, furnaceLit
+    case craftingTable = 20, furnace, furnaceLit, torch
     // water cases stay contiguous at the end: source, then flowing levels 1-7
     case water = 100, flow1, flow2, flow3, flow4, flow5, flow6, flow7
 }
 
 extension Block {
     var isWater: Bool { rawValue >= Block.water.rawValue }
+
+    /// Light lost per propagation step: 1 = clear, 16 = fully blocks light.
+    var lightOpacity: UInt8 {
+        switch self {
+        case .air, .torch: return 1
+        case .leaves: return 2
+        default: return isWater ? 3 : 16
+        }
+    }
+
+    var lightEmission: UInt8 {
+        switch self {
+        case .torch: return 14
+        case .furnaceLit: return 13
+        default: return 0
+        }
+    }
     /// 0 = source (full), 1-7 = flowing, weaker as the number rises
     var waterLevel: Int { Int(rawValue) - Int(Block.water.rawValue) }
     static func flowing(_ level: Int) -> Block {
@@ -34,6 +51,9 @@ struct BlockPos: Hashable {
 
 final class Chunk {
     var blocks = [UInt8](repeating: 0, count: World.chunkSize * World.height * World.chunkSize)
+    /// Authoritative light values (sky<<4 | block), maintained incrementally
+    /// like beta Minecraft: small flood fills on edits, never bulk recompute.
+    var light = [UInt8](repeating: 0, count: World.chunkSize * World.height * World.chunkSize)
 
     @inline(__always)
     static func index(_ lx: Int, _ y: Int, _ lz: Int) -> Int {
@@ -75,12 +95,14 @@ final class World {
     func generateChunk(_ c: ChunkCoord) {
         guard chunks[c] == nil else { return }
         chunks[c] = generator.buildChunk(c)
+        reconcileLight(c)
     }
 
     /// Adopt a chunk built off-thread; first writer wins.
     func insertChunk(_ chunk: Chunk, at c: ChunkCoord) {
         guard chunks[c] == nil else { return }
         chunks[c] = chunk
+        reconcileLight(c)
     }
 
     /// Copy-on-write handle to a chunk's block storage for snapshotting.
@@ -99,13 +121,174 @@ final class World {
             return true // ungenerated terrain blocks movement until it streams in
         }
         let b = Block(rawValue: chunk.blocks[Chunk.index(x & 15, y, z & 15)]) ?? .air
-        return b != .air && !b.isWater
+        return b != .air && !b.isWater && b != .torch
+    }
+
+    /// Copy-on-write handle to a chunk's light storage for snapshotting.
+    func chunkLight(_ c: ChunkCoord) -> [UInt8]? { chunks[c]?.light }
+
+    /// (sky, block) light 0-15 at a cell; unlit chunks default to daylight.
+    func lightAt(_ x: Int, _ y: Int, _ z: Int) -> SIMD2<Float> {
+        guard y >= 0 else { return .zero }
+        guard y < Self.height else { return SIMD2(15, 0) }
+        guard let chunk = chunks[Self.chunkCoord(blockX: x, blockZ: z)] else { return SIMD2(15, 0) }
+        let v = chunk.light[Chunk.index(x & 15, y, z & 15)]
+        return SIMD2(Float(v >> 4), Float(v & 15))
+    }
+
+    // MARK: - Incremental lighting (beta-style)
+    // Light lives in the chunks and is repaired locally on every change:
+    // an "unlight" flood removes a source's contribution, then an addition
+    // flood re-relaxes from the boundary. Work scales with the affected
+    // region (a torch is ~10² cells), not with chunk size.
+
+    private static let lightDirs: [(Int, Int, Int)] = [
+        (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1),
+    ]
+
+    /// -1 = no data there (ungenerated/out of world): propagation stops.
+    @inline(__always)
+    private func lightValue(sky isSky: Bool, _ x: Int, _ y: Int, _ z: Int) -> Int {
+        if y >= Self.height { return isSky ? 15 : 0 }
+        if y < 0 { return -1 }
+        guard let ch = chunks[Self.chunkCoord(blockX: x, blockZ: z)] else { return -1 }
+        let v = ch.light[Chunk.index(x & 15, y, z & 15)]
+        return Int(isSky ? v >> 4 : v & 15)
+    }
+
+    @inline(__always)
+    private func setLightValue(sky isSky: Bool, _ x: Int, _ y: Int, _ z: Int, _ v: Int) {
+        guard y >= 0 && y < Self.height else { return }
+        let cc = Self.chunkCoord(blockX: x, blockZ: z)
+        guard let ch = chunks[cc] else { return }
+        let i = Chunk.index(x & 15, y, z & 15)
+        ch.light[i] = isSky ? (UInt8(v) << 4) | (ch.light[i] & 0x0F)
+                            : (ch.light[i] & 0xF0) | UInt8(v)
+        // remesh every chunk whose smooth lighting samples this cell
+        dirtyChunks.insert(cc)
+        let lx = x & 15, lz = z & 15
+        if lx == 0 { dirtyChunks.insert(ChunkCoord(x: cc.x - 1, z: cc.z)) }
+        if lx == 15 { dirtyChunks.insert(ChunkCoord(x: cc.x + 1, z: cc.z)) }
+        if lz == 0 { dirtyChunks.insert(ChunkCoord(x: cc.x, z: cc.z - 1)) }
+        if lz == 15 { dirtyChunks.insert(ChunkCoord(x: cc.x, z: cc.z + 1)) }
+    }
+
+    /// Relax outward from the queued cells until nothing brightens.
+    private func propagateLight(sky isSky: Bool, _ queue: inout [BlockPos]) {
+        var head = 0
+        while head < queue.count {
+            let p = queue[head]; head += 1
+            let l = lightValue(sky: isSky, p.x, p.y, p.z)
+            guard l > 1 else { continue }
+            for (d, dir) in Self.lightDirs.enumerated() {
+                let nx = p.x + dir.0, ny = p.y + dir.1, nz = p.z + dir.2
+                guard ny >= 0 && ny < Self.height else { continue }
+                let op = Int(block(nx, ny, nz).lightOpacity)
+                guard op < 16 else { continue }
+                let cur = lightValue(sky: isSky, nx, ny, nz)
+                guard cur >= 0 else { continue }
+                // full skylight pours straight down without attenuation
+                let nl = (isSky && d == 3 && l == 15) ? 15 - (op - 1) : l - op
+                if nl > cur {
+                    setLightValue(sky: isSky, nx, ny, nz, nl)
+                    queue.append(BlockPos(x: nx, y: ny, z: nz))
+                }
+            }
+        }
+        queue.removeAll(keepingCapacity: true)
+    }
+
+    /// Spread darkness from a removed source: cells this path lit go to 0 and
+    /// keep cascading; brighter boundary cells become re-fill seeds.
+    private func unlight(sky isSky: Bool, start: [(BlockPos, Int)], seeds: inout [BlockPos]) {
+        var queue = start
+        var head = 0
+        while head < queue.count {
+            let (p, old) = queue[head]; head += 1
+            for (d, dir) in Self.lightDirs.enumerated() {
+                let nx = p.x + dir.0, ny = p.y + dir.1, nz = p.z + dir.2
+                guard ny >= 0 && ny < Self.height else { continue }
+                let cur = lightValue(sky: isSky, nx, ny, nz)
+                guard cur > 0 else { continue }
+                if cur < old || (isSky && d == 3 && old == 15 && cur == 15) {
+                    setLightValue(sky: isSky, nx, ny, nz, 0)
+                    queue.append((BlockPos(x: nx, y: ny, z: nz), cur))
+                } else {
+                    seeds.append(BlockPos(x: nx, y: ny, z: nz))
+                }
+            }
+        }
+    }
+
+    /// Repair both channels around one changed cell.
+    private func relight(_ x: Int, _ y: Int, _ z: Int, old: Block, new: Block) {
+        guard old.lightOpacity != new.lightOpacity
+            || old.lightEmission != new.lightEmission else { return }
+        let pos = BlockPos(x: x, y: y, z: z)
+        for isSky in [true, false] {
+            var seeds: [BlockPos] = []
+            let cur = lightValue(sky: isSky, x, y, z)
+            if cur > 0 {
+                setLightValue(sky: isSky, x, y, z, 0)
+                unlight(sky: isSky, start: [(pos, cur)], seeds: &seeds)
+            }
+            if !isSky {
+                let em = Int(new.lightEmission)
+                if em > 0 {
+                    setLightValue(sky: false, x, y, z, em)
+                    seeds.append(pos)
+                }
+            }
+            // neighbors re-fill the hole (and the cell itself, if transparent)
+            for dir in Self.lightDirs {
+                seeds.append(BlockPos(x: x + dir.0, y: y + dir.1, z: z + dir.2))
+            }
+            propagateLight(sky: isSky, &seeds)
+        }
+    }
+
+    /// Stitch a freshly inserted chunk's light to its generated neighbors:
+    /// push whichever side of each border pair can brighten the other.
+    private func reconcileLight(_ c: ChunkCoord) {
+        var skySeeds: [BlockPos] = []
+        var blkSeeds: [BlockPos] = []
+        let bx = c.x << 4, bz = c.z << 4
+        let borders: [(ChunkCoord, (Int) -> (BlockPos, BlockPos))] = [
+            (ChunkCoord(x: c.x - 1, z: c.z), { i in
+                (BlockPos(x: bx, y: i >> 4, z: bz + (i & 15)),
+                 BlockPos(x: bx - 1, y: i >> 4, z: bz + (i & 15))) }),
+            (ChunkCoord(x: c.x + 1, z: c.z), { i in
+                (BlockPos(x: bx + 15, y: i >> 4, z: bz + (i & 15)),
+                 BlockPos(x: bx + 16, y: i >> 4, z: bz + (i & 15))) }),
+            (ChunkCoord(x: c.x, z: c.z - 1), { i in
+                (BlockPos(x: bx + (i & 15), y: i >> 4, z: bz),
+                 BlockPos(x: bx + (i & 15), y: i >> 4, z: bz - 1)) }),
+            (ChunkCoord(x: c.x, z: c.z + 1), { i in
+                (BlockPos(x: bx + (i & 15), y: i >> 4, z: bz + 15),
+                 BlockPos(x: bx + (i & 15), y: i >> 4, z: bz + 16)) }),
+        ]
+        for (nc, cellPair) in borders where chunks[nc] != nil {
+            for i in 0..<(16 * Self.height) {
+                let (inner, outer) = cellPair(i)
+                let sa = lightValue(sky: true, inner.x, inner.y, inner.z)
+                let sb = lightValue(sky: true, outer.x, outer.y, outer.z)
+                if sa > sb + 1 { skySeeds.append(inner) }
+                else if sb > sa + 1 { skySeeds.append(outer) }
+                let ba = lightValue(sky: false, inner.x, inner.y, inner.z)
+                let bb = lightValue(sky: false, outer.x, outer.y, outer.z)
+                if ba > bb + 1 { blkSeeds.append(inner) }
+                else if bb > ba + 1 { blkSeeds.append(outer) }
+            }
+        }
+        propagateLight(sky: true, &skySeeds)
+        propagateLight(sky: false, &blkSeeds)
     }
 
     func setBlock(_ x: Int, _ y: Int, _ z: Int, _ b: Block) {
         guard y >= 0 && y < Self.height else { return }
         let cc = Self.chunkCoord(blockX: x, blockZ: z)
         guard let chunk = chunks[cc] else { return }
+        let old = Block(rawValue: chunk.blocks[Chunk.index(x & 15, y, z & 15)]) ?? .air
         chunk.blocks[Chunk.index(x & 15, y, z & 15)] = b.rawValue
         dirtyChunks.insert(cc)
         let lx = x & 15, lz = z & 15
@@ -113,6 +296,8 @@ final class World {
         if lx == 15 { dirtyChunks.insert(ChunkCoord(x: cc.x + 1, z: cc.z)) }
         if lz == 0 { dirtyChunks.insert(ChunkCoord(x: cc.x, z: cc.z - 1)) }
         if lz == 15 { dirtyChunks.insert(ChunkCoord(x: cc.x, z: cc.z + 1)) }
+        // repair light locally; touched chunks are marked dirty as cells change
+        relight(x, y, z, old: old, new: b)
         // any edit can change how water wants to flow here and around here
         pendingWater.insert(BlockPos(x: x, y: y, z: z))
         pendingWater.insert(BlockPos(x: x + 1, y: y, z: z))
@@ -357,6 +542,69 @@ struct TerrainGen {
             }
         }
 
+        computeInitialLight(chunk)
         return chunk
+    }
+
+    /// Generation-time skylight: per-column fill from the sky, then a flood
+    /// fill bounded to this chunk so overhangs and cave mouths grade smoothly.
+    /// Cross-chunk seams are stitched on the main thread when the chunk is
+    /// adopted (World.reconcileLight).
+    private func computeInitialLight(_ chunk: Chunk) {
+        let H = World.height
+        // hFull[col] = lowest y from which everything above is full skylight
+        var hFull = [Int](repeating: 0, count: 256)
+        for lz in 0..<16 {
+            for lx in 0..<16 {
+                var l = 15
+                for y in stride(from: H - 1, through: 0, by: -1) {
+                    let i = Chunk.index(lx, y, lz)
+                    let o = Int((Block(rawValue: chunk.blocks[i]) ?? .air).lightOpacity)
+                    if o >= 16 { l = 0 } else if o > 1 { l = max(0, l - o) }
+                    if l < 15 && hFull[lz * 16 + lx] == 0 { hFull[lz * 16 + lx] = y + 1 }
+                    if l == 0 { break } // rest of the column stays dark
+                    chunk.light[i] = UInt8(l) << 4
+                }
+            }
+        }
+
+        // seed sideways spread where a column's full-lit cells border a
+        // shadowed stretch of an adjacent column
+        var queue: [Int] = [] // packed (lx, y, lz)
+        for lz in 0..<16 {
+            for lx in 0..<16 {
+                let own = hFull[lz * 16 + lx]
+                var hMax = own
+                if lx > 0 { hMax = max(hMax, hFull[lz * 16 + lx - 1]) }
+                if lx < 15 { hMax = max(hMax, hFull[lz * 16 + lx + 1]) }
+                if lz > 0 { hMax = max(hMax, hFull[(lz - 1) * 16 + lx]) }
+                if lz < 15 { hMax = max(hMax, hFull[(lz + 1) * 16 + lx]) }
+                for y in own..<hMax {
+                    queue.append((y << 8) | (lz << 4) | lx)
+                }
+            }
+        }
+
+        var head = 0
+        while head < queue.count {
+            let p = queue[head]; head += 1
+            let lx = p & 15, lz = (p >> 4) & 15, y = p >> 8
+            let l = Int(chunk.light[Chunk.index(lx, y, lz)] >> 4)
+            guard l > 1 else { continue }
+            for (d, dir) in [(0, (1, 0, 0)), (1, (-1, 0, 0)), (2, (0, 1, 0)),
+                             (3, (0, -1, 0)), (4, (0, 0, 1)), (5, (0, 0, -1))] {
+                let nx = lx + dir.0, ny = y + dir.1, nz = lz + dir.2
+                guard nx >= 0, nx < 16, nz >= 0, nz < 16, ny >= 0, ny < H else { continue }
+                let ni = Chunk.index(nx, ny, nz)
+                let o = Int((Block(rawValue: chunk.blocks[ni]) ?? .air).lightOpacity)
+                guard o < 16 else { continue }
+                let cur = Int(chunk.light[ni] >> 4)
+                let nl = (d == 3 && l == 15) ? 15 - (o - 1) : l - o
+                if nl > cur {
+                    chunk.light[ni] = UInt8(nl) << 4
+                    queue.append((ny << 8) | (nz << 4) | nx)
+                }
+            }
+        }
     }
 }

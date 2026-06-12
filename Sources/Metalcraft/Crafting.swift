@@ -31,6 +31,7 @@ enum Crafting {
         add(&r, [[p], [p]], .stick, 4)
         add(&r, [[p, p], [p, p]], .block(.craftingTable))
         add(&r, [[c, c, c], [c, nil, c], [c, c, c]], .block(.furnace))
+        add(&r, [[Item.coal], [s]], .block(.torch), 4)
 
         // tools: same shapes as the real game, one set per material
         for m in ToolMaterial.allCases {

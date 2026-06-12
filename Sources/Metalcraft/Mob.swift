@@ -442,7 +442,8 @@ enum MobModels {
                 // never bleeds into the neighboring region
                 verts.append((uv.x + (uv.x < center.x ? 0.03 : -0.03)) / textureSize.x)
                 verts.append((uv.y + (uv.y < center.y ? 0.03 : -0.03)) / textureSize.y)
-                verts.append(contentsOf: [1, 1, 1])
+                // entities use per-draw light (mode 1); vertex light is unused
+                verts.append(contentsOf: [1, 1, 1, 15, 0])
             }
             indices.append(contentsOf: [base, base + 1, base + 2, base, base + 2, base + 3])
         }

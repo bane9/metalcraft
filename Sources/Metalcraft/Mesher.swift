@@ -7,32 +7,29 @@ struct ChunkGeometry {
     var waterIndices: [UInt32] = []
 }
 
-/// Anything the mesher can read terrain from: the live world on the main
-/// thread, or an immutable snapshot on a background worker.
-protocol BlockSource {
-    func block(_ x: Int, _ y: Int, _ z: Int) -> Block
-}
-
-extension World: BlockSource {}
-
 /// Copy-on-write snapshot of a chunk and its eight neighbors. The arrays
 /// share storage with the live chunks; any later main-thread edit copies on
 /// write, so background reads stay consistent without locks.
-struct ChunkSnapshot: BlockSource {
-    private let baseX: Int // block coords of the 3x3 area's min corner
-    private let baseZ: Int
+struct ChunkSnapshot {
+    let baseX: Int // block coords of the 3x3 area's min corner
+    let baseZ: Int
     private let grids: [[UInt8]?] // indexed [gz * 3 + gx], nil if ungenerated
+    private let lightGrids: [[UInt8]?] // sky<<4 | block, same indexing
 
     init(world: World, center: ChunkCoord) {
         baseX = (center.x - 1) * World.chunkSize
         baseZ = (center.z - 1) * World.chunkSize
         var g: [[UInt8]?] = []
+        var l: [[UInt8]?] = []
         for dz in -1...1 {
             for dx in -1...1 {
-                g.append(world.chunkBlocks(ChunkCoord(x: center.x + dx, z: center.z + dz)))
+                let c = ChunkCoord(x: center.x + dx, z: center.z + dz)
+                g.append(world.chunkBlocks(c))
+                l.append(world.chunkLight(c))
             }
         }
         grids = g
+        lightGrids = l
     }
 
     func block(_ x: Int, _ y: Int, _ z: Int) -> Block {
@@ -42,14 +39,24 @@ struct ChunkSnapshot: BlockSource {
               let blocks = grids[(lz >> 4) * 3 + (lx >> 4)] else { return .air }
         return Block(rawValue: blocks[Chunk.index(lx & 15, y, lz & 15)]) ?? .air
     }
+
+    func light(_ x: Int, _ y: Int, _ z: Int) -> SIMD2<Float> {
+        if y >= World.height { return SIMD2(15, 0) }
+        if y < 0 { return .zero }
+        let lx = x - baseX, lz = z - baseZ
+        guard lx >= 0, lz >= 0, lx < 48, lz < 48,
+              let light = lightGrids[(lz >> 4) * 3 + (lx >> 4)] else { return SIMD2(15, 0) }
+        let v = light[Chunk.index(lx & 15, y, lz & 15)]
+        return SIMD2(Float(v >> 4), Float(v & 15))
+    }
 }
 
 /// Builds chunk triangle meshes on the CPU: a quad for every visible block
-/// face. Water goes in a separate mesh so it can render in a blended pass.
-/// Vertex layout matches `VIn` in the shader:
-/// position(3) + normal(3) + uv(2) + tint(3) floats.
+/// face, lit by a Minecraft-style two-channel voxel light field (skylight +
+/// blocklight) computed over the 3×3 snapshot. Vertex layout matches `VIn`:
+/// position(3) + normal(3) + uv(2) + tint(3) + light(2) floats.
 enum Mesher {
-    static let floatsPerVertex = 11
+    static let floatsPerVertex = 13
 
     // 0:+X 1:-X 2:+Y 3:-Y 4:+Z 5:-Z
     static let normals: [SIMD3<Float>] = [
@@ -70,6 +77,9 @@ enum Mesher {
         [SIMD3(0, 0, 1), SIMD3(1, 0, 1), SIMD3(1, 1, 1), SIMD3(0, 1, 1)],
         [SIMD3(0, 0, 0), SIMD3(0, 1, 0), SIMD3(1, 1, 0), SIMD3(1, 0, 0)],
     ]
+    /// The two axes spanning each face, for smooth-light corner sampling.
+    static let tangents: [(Int, Int)] = [(1, 2), (1, 2), (0, 2), (0, 2), (0, 1), (0, 1)]
+
     // texture v runs top-to-bottom, so v = 1 - worldY on side faces
     static let uvCorners: [[SIMD2<Float>]] = [
         [SIMD2(0, 1), SIMD2(0, 0), SIMD2(1, 0), SIMD2(1, 1)], // +X
@@ -109,6 +119,7 @@ enum Mesher {
         case .diamondOre: return SIMD2(2, 3)
         case .redstoneOre: return SIMD2(3, 3)
         case .gravel: return SIMD2(3, 1)
+        case .torch: return SIMD2(0, 5)
         case .craftingTable:
             if dir == 2 { return SIMD2(11, 2) }
             if dir == 3 { return SIMD2(4, 0) }
@@ -131,12 +142,16 @@ enum Mesher {
         }
     }
 
+    static let fullBright = [SIMD2<Float>](repeating: SIMD2(15, 0), count: 4)
+
     /// `heights` gives the block-top height at each (x,z) corner, indexed by
     /// cornerX * 2 + cornerZ — all 1s for solid cubes, per-corner interpolated
-    /// values for water surfaces.
+    /// values for water surfaces. `lights` carries per-corner (sky, block)
+    /// levels 0-15, matching the corner order.
     static func appendFace(_ verts: inout [Float], _ indices: inout [UInt32],
                            block: Block, dir: Int,
-                           origin: SIMD3<Float>, heights: [Float] = [1, 1, 1, 1]) {
+                           origin: SIMD3<Float>, heights: [Float] = [1, 1, 1, 1],
+                           lights: [SIMD2<Float>] = fullBright) {
         let n = normals[dir]
         let t = tile(block, dir)
         let tn = tint(block, dir)
@@ -156,24 +171,58 @@ enum Mesher {
             verts.append((t.x + 0.002 + uv.x * 0.996) / 16)
             verts.append((t.y + 0.002 + v * 0.996) / 16)
             verts.append(tn.x); verts.append(tn.y); verts.append(tn.z)
+            verts.append(lights[ci].x); verts.append(lights[ci].y)
         }
         indices.append(contentsOf: [base, base + 1, base + 2, base, base + 2, base + 3])
+    }
+
+    /// Classic torch: four full-size quads pinched in around the stick (the
+    /// texture's alpha trims them) plus the glowing tip's top face.
+    static func appendTorch(_ verts: inout [Float], _ indices: inout [UInt32],
+                            origin: SIMD3<Float>, light: SIMD2<Float>) {
+        let t = SIMD2<Float>(0, 5)
+        func quad(_ ps: [SIMD3<Float>], _ uvs: [SIMD2<Float>], _ n: SIMD3<Float>) {
+            let base = UInt32(verts.count / floatsPerVertex)
+            for (p, uv) in zip(ps, uvs) {
+                verts.append(contentsOf: [origin.x + p.x, origin.y + p.y, origin.z + p.z,
+                                          n.x, n.y, n.z,
+                                          (t.x + 0.002 + uv.x * 0.996) / 16,
+                                          (t.y + 0.002 + uv.y * 0.996) / 16,
+                                          1, 1, 1,
+                                          light.x, light.y])
+            }
+            indices.append(contentsOf: [base, base + 1, base + 2, base, base + 2, base + 3])
+        }
+        let sideUV: [SIMD2<Float>] = [SIMD2(0, 1), SIMD2(0, 0), SIMD2(1, 0), SIMD2(1, 1)]
+        let lo: Float = 7 / 16, hi: Float = 9 / 16
+        quad([SIMD3(lo, 0, 0), SIMD3(lo, 1, 0), SIMD3(lo, 1, 1), SIMD3(lo, 0, 1)],
+             sideUV, SIMD3(-1, 0, 0))
+        quad([SIMD3(hi, 0, 0), SIMD3(hi, 1, 0), SIMD3(hi, 1, 1), SIMD3(hi, 0, 1)],
+             sideUV, SIMD3(1, 0, 0))
+        quad([SIMD3(0, 0, lo), SIMD3(0, 1, lo), SIMD3(1, 1, lo), SIMD3(1, 0, lo)],
+             sideUV, SIMD3(0, 0, -1))
+        quad([SIMD3(0, 0, hi), SIMD3(0, 1, hi), SIMD3(1, 1, hi), SIMD3(1, 0, hi)],
+             sideUV, SIMD3(0, 0, 1))
+        // tip: the 2×2 px patch of the texture at (7,6)..(9,8)
+        let tipUV: [SIMD2<Float>] = [SIMD2(7.0 / 16, 6.0 / 16), SIMD2(7.0 / 16, 8.0 / 16),
+                                     SIMD2(9.0 / 16, 8.0 / 16), SIMD2(9.0 / 16, 6.0 / 16)]
+        quad([SIMD3(lo, 10.0 / 16, lo), SIMD3(lo, 10.0 / 16, hi),
+              SIMD3(hi, 10.0 / 16, hi), SIMD3(hi, 10.0 / 16, lo)],
+             tipUV, SIMD3(0, 1, 0))
     }
 
     /// Minecraft-style sloped water: a top corner's height is the average of
     /// the water surface heights of the up-to-4 water cells sharing that
     /// corner. Any of them carrying water above pins the corner to full.
-    /// Adjacent blocks share corner values, so surfaces interpolate smoothly
-    /// between flow levels instead of stepping.
-    static func waterCornerHeight(_ world: some BlockSource, _ x: Int, _ y: Int, _ z: Int,
+    static func waterCornerHeight(_ snap: ChunkSnapshot, _ x: Int, _ y: Int, _ z: Int,
                                   _ cx: Int, _ cz: Int) -> Float {
         var sum: Float = 0
         var count: Float = 0
         for dx in (cx - 1)...cx {
             for dz in (cz - 1)...cz {
-                let nb = world.block(x + dx, y, z + dz)
+                let nb = snap.block(x + dx, y, z + dz)
                 guard nb.isWater else { continue }
-                if world.block(x + dx, y + 1, z + dz).isWater { return 1 }
+                if snap.block(x + dx, y + 1, z + dz).isWater { return 1 }
                 sum += (8 - Float(nb.waterLevel)) / 9
                 count += 1
             }
@@ -181,58 +230,89 @@ enum Mesher {
         return count > 0 ? sum / count : 1
     }
 
-    /// Face culling uses opacity, not solidity: leaves have see-through holes,
-    /// so faces behind them must still render.
+    /// Face culling uses opacity, not solidity: leaves have see-through holes
+    /// and torches are tiny, so faces behind them must still render.
     @inline(__always)
-    static func opaqueAt(_ world: some BlockSource, _ x: Int, _ y: Int, _ z: Int) -> Bool {
+    static func opaqueAt(_ snap: ChunkSnapshot, _ x: Int, _ y: Int, _ z: Int) -> Bool {
         if y < 0 { return true }
         if y >= World.height { return false }
-        let b = world.block(x, y, z)
-        return b != .air && b != .leaves && !b.isWater
+        let b = snap.block(x, y, z)
+        return b != .air && b != .leaves && b != .torch && !b.isWater
     }
 
-    static func buildChunk(world: some BlockSource, coord: ChunkCoord) -> ChunkGeometry {
+    // MARK: - Chunk meshing
+
+    static func buildChunk(snapshot snap: ChunkSnapshot, coord: ChunkCoord) -> ChunkGeometry {
         var geo = ChunkGeometry()
         geo.opaqueVertices.reserveCapacity(16384)
         geo.opaqueIndices.reserveCapacity(4096)
+
+        /// Smooth lighting: each face corner averages the four cells that
+        /// touch it in the face plane; solid cells contribute 0, which doubles
+        /// as soft ambient occlusion in corners.
+        func cornerLights(_ dir: Int, _ x: Int, _ y: Int, _ z: Int) -> [SIMD2<Float>] {
+            let o = offsets[dir]
+            let n = SIMD3<Int>(x + o.x, y + o.y, z + o.z)
+            let (t1, t2) = tangents[dir]
+            return corners[dir].map { corner in
+                var e1 = SIMD3<Int>.zero, e2 = SIMD3<Int>.zero
+                e1[t1] = corner[t1] > 0.5 ? 1 : -1
+                e2[t2] = corner[t2] > 0.5 ? 1 : -1
+                let a = snap.light(n.x, n.y, n.z)
+                let b = snap.light(n.x + e1.x, n.y + e1.y, n.z + e1.z)
+                let c = snap.light(n.x + e2.x, n.y + e2.y, n.z + e2.z)
+                let d = snap.light(n.x + e1.x + e2.x, n.y + e1.y + e2.y, n.z + e1.z + e2.z)
+                return (a + b + c + d) / 4
+            }
+        }
 
         let x0 = coord.x * World.chunkSize, z0 = coord.z * World.chunkSize
         for y in 0..<World.height {
             for lz in 0..<World.chunkSize {
                 for lx in 0..<World.chunkSize {
                     let x = x0 + lx, z = z0 + lz
-                    let b = world.block(x, y, z)
+                    let b = snap.block(x, y, z)
                     if b == .air { continue }
+                    let origin = SIMD3<Float>(Float(x), Float(y), Float(z))
+
+                    if b == .torch {
+                        appendTorch(&geo.opaqueVertices, &geo.opaqueIndices,
+                                    origin: origin, light: snap.light(x, y, z))
+                        continue
+                    }
+
                     let isWater = b.isWater
                     var heights: [Float] = [1, 1, 1, 1]
-                    if isWater && !world.block(x, y + 1, z).isWater {
+                    if isWater && !snap.block(x, y + 1, z).isWater {
                         for cx in 0...1 {
                             for cz in 0...1 {
-                                heights[cx * 2 + cz] = waterCornerHeight(world, x, y, z, cx, cz)
+                                heights[cx * 2 + cz] = waterCornerHeight(snap, x, y, z, cx, cz)
                             }
                         }
                     }
-                    let origin = SIMD3<Float>(Float(x), Float(y), Float(z))
 
                     for d in 0..<6 {
                         let o = offsets[d]
                         if isWater {
-                            let nb = world.block(x + o.x, y + o.y, z + o.z)
-                            guard nb == .air || nb == .leaves else { continue }
-                        } else if opaqueAt(world, x + o.x, y + o.y, z + o.z) {
+                            let nb = snap.block(x + o.x, y + o.y, z + o.z)
+                            guard nb == .air || nb == .leaves || nb == .torch else { continue }
+                        } else if opaqueAt(snap, x + o.x, y + o.y, z + o.z) {
                             continue
                         }
+                        let lights = cornerLights(d, x, y, z)
                         if isWater {
                             appendFace(&geo.waterVertices, &geo.waterIndices,
-                                       block: b, dir: d, origin: origin, heights: heights)
+                                       block: b, dir: d, origin: origin,
+                                       heights: heights, lights: lights)
                         } else {
                             appendFace(&geo.opaqueVertices, &geo.opaqueIndices,
-                                       block: b, dir: d, origin: origin)
+                                       block: b, dir: d, origin: origin, lights: lights)
                         }
                     }
                 }
             }
         }
+
         return geo
     }
 
