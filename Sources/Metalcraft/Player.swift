@@ -59,6 +59,11 @@ final class Player {
     var flying = false // spectator: noclip + free vertical movement
     private var hitWall = false
 
+    // walk-cycle phase and 0-1 intensity: drives the first-person view bob
+    // and the third-person model's limb swing
+    var bobPhase: Float = 0
+    var bobAmount: Float = 0
+
     var eye: SIMD3<Float> { pos + SIMD3(0, Self.eyeHeight, 0) }
     var forward: SIMD3<Float> {
         SIMD3(sin(yaw) * cos(pitch), sin(pitch), -cos(yaw) * cos(pitch))
@@ -100,6 +105,7 @@ final class Player {
             vel += (wish * 18 - vel) * blend
             pos += vel * dt
             onGround = false
+            bobAmount *= exp(-6 * dt)
             if pos.y < -64 { spawn(in: world) }
             return
         }
@@ -152,6 +158,11 @@ final class Player {
         if inWater && hitWall && simd_length_squared(wishDir) > 0 {
             vel.y = max(vel.y, 6.5)
         }
+
+        let hspeed = simd_length(SIMD2(vel.x, vel.z))
+        let target = onGround ? min(hspeed / 4.8, 1.2) : 0
+        bobAmount += (target - bobAmount) * min(1, 8 * dt)
+        bobPhase += hspeed * dt * 2.2
 
         if pos.y < -12 { spawn(in: world) }
     }

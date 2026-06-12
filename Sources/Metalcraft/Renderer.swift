@@ -32,6 +32,20 @@ struct CubeMesh {
     var indexCount: Int
 }
 
+/// GPU-side mob model: one mesh per (part, texture) pair, animated by
+/// composing per-part pivot rotations at draw time.
+struct MobPartMesh {
+    var role: PartRole
+    var pivot: SIMD3<Float> // meters
+    var baseRotX: Float
+    var submeshes: [(tex: Int, mesh: CubeMesh)]
+}
+
+struct MobModel {
+    var parts: [MobPartMesh]
+    var textures: [MTLTexture]
+}
+
 final class Renderer: NSObject, MTKViewDelegate {
     let device: MTLDevice
     let queue: MTLCommandQueue
@@ -51,6 +65,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     let player = Player()
     let inventory = Inventory()
     var items: [ItemEntity] = []
+    var mobs: [Mob] = []
     let input: Input
     weak var hud: NSTextField?
     private var countLabels: [NSTextField] = []
@@ -58,6 +73,11 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var meshes: [ChunkCoord: ChunkMesh] = [:]
     private var itemMeshCache: [UInt8: CubeMesh] = [:]
     private var iconMeshCache: [UInt8: CubeMesh] = [:]
+    private var mobModelCache: [MobKind: MobModel] = [:]
+    private var mobTextureCache: [String: MTLTexture] = [:]
+    private lazy var playerModel = buildModel(MobModels.humanoid(), textureNames: ["char"])
+    private var mobSpawnTimer: Float = 0
+    private var thirdPerson = false
     private var aspect: Float = 16.0 / 9.0
     private var lastTime = CACurrentMediaTime()
     private var lastSpaceTap: CFTimeInterval = -10
@@ -182,6 +202,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         world.reset(seed: UInt64.random(in: 0...UInt64.max))
         meshes.removeAll()
         items.removeAll()
+        mobs.removeAll()
         inventory.clear()
         for dz in -2...2 {
             for dx in -2...2 { world.generateChunk(ChunkCoord(x: dx, z: dz)) }
@@ -232,10 +253,33 @@ final class Renderer: NSObject, MTKViewDelegate {
         input.rightClicks = 0
 
         updateItems(dt: dt)
+        updateMobs(dt: dt)
         remeshDirtyChunks()
         streamMeshes()
 
-        let eye = player.eye
+        // camera: player eye, pulled back in third person, or swaying with
+        // the walk cycle in first person
+        var eye = player.eye
+        if thirdPerson {
+            var dist: Float = 4
+            var t: Float = 0.25
+            while t < dist {
+                let p = player.eye - player.forward * t
+                if world.isSolid(Int(p.x.rounded(.down)),
+                                 Int(p.y.rounded(.down)),
+                                 Int(p.z.rounded(.down))) {
+                    dist = max(t - 0.35, 0.4)
+                    break
+                }
+                t += 0.1
+            }
+            eye -= player.forward * dist
+        } else {
+            let right = SIMD3<Float>(cos(player.yaw), 0, sin(player.yaw))
+            let b = min(player.bobAmount, 1.2) * 0.045
+            eye += SIMD3(0, abs(cos(player.bobPhase)) * b, 0)
+                + right * sin(player.bobPhase) * b * 0.5
+        }
         let eyeInWater = world.block(Int(eye.x.rounded(.down)),
                                      Int(eye.y.rounded(.down)),
                                      Int(eye.z.rounded(.down))).isWater
@@ -295,6 +339,30 @@ final class Renderer: NSObject, MTKViewDelegate {
                                       indexType: .uint32, indexBuffer: mesh.indexBuffer,
                                       indexBufferOffset: 0)
         }
+
+        // mobs: boxed models with swinging limbs and a walk-cycle body bob
+        for mob in mobs {
+            let bob = abs(cos(mob.limbSwing)) * 0.05 * mob.swingAmount
+            let entity = translationMatrix(mob.pos + SIMD3(0, bob, 0))
+                * rotationYMatrix(-mob.yaw)
+            let flap: Float = mob.kind == .chicken && !mob.onGround
+                ? 1.0 + sin(mob.age * 30) * 0.8 : 0
+            drawModel(enc, model: model(for: mob.kind), entity: entity,
+                      uniforms: uniforms, swing: mob.limbSwing,
+                      amount: mob.swingAmount, headPitch: 0, flap: flap)
+        }
+
+        // the player's own model, visible in third person
+        if thirdPerson {
+            let bob = abs(cos(player.bobPhase)) * 0.06 * min(player.bobAmount, 1)
+            let entity = translationMatrix(player.pos + SIMD3(0, bob, 0))
+                * rotationYMatrix(-player.yaw)
+            drawModel(enc, model: playerModel, entity: entity,
+                      uniforms: uniforms, swing: player.bobPhase,
+                      amount: min(player.bobAmount, 1.2),
+                      headPitch: player.pitch, flap: 0)
+        }
+        enc.setFragmentTexture(atlas, index: 0) // restore for the passes below
 
         // targeted-block outline
         if let hit {
@@ -453,6 +521,96 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
+    // MARK: - Mobs
+
+    private func mobTexture(_ name: String) -> MTLTexture {
+        if let t = mobTextureCache[name] { return t }
+        let url = Bundle.module.url(forResource: name, withExtension: "png", subdirectory: "mob")!
+        let t = try! MTKTextureLoader(device: device).newTexture(URL: url, options: [.SRGB: false])
+        mobTextureCache[name] = t
+        return t
+    }
+
+    private func buildModel(_ spec: ModelSpec, textureNames: [String]) -> MobModel {
+        var parts: [MobPartMesh] = []
+        for p in spec.parts {
+            var subs: [(tex: Int, mesh: CubeMesh)] = []
+            for (tex, verts, indices) in MobModels.geometry(for: p, scale: spec.scale) {
+                subs.append((tex, CubeMesh(
+                    vertexBuffer: device.makeBuffer(bytes: verts, length: verts.count * 4)!,
+                    indexBuffer: device.makeBuffer(bytes: indices, length: indices.count * 4)!,
+                    indexCount: indices.count)))
+            }
+            parts.append(MobPartMesh(role: p.role, pivot: p.pivot * spec.scale,
+                                     baseRotX: p.baseRotX, submeshes: subs))
+        }
+        return MobModel(parts: parts, textures: textureNames.map { mobTexture($0) })
+    }
+
+    private func model(for kind: MobKind) -> MobModel {
+        if let m = mobModelCache[kind] { return m }
+        let m = buildModel(MobModels.spec(for: kind), textureNames: kind.textureNames)
+        mobModelCache[kind] = m
+        return m
+    }
+
+    private func drawModel(_ enc: MTLRenderCommandEncoder, model: MobModel,
+                           entity: simd_float4x4, uniforms: Uniforms,
+                           swing: Float, amount: Float, headPitch: Float, flap: Float) {
+        for part in model.parts {
+            var u = uniforms
+            u.model = entity * translationMatrix(part.pivot)
+                * MobModels.animation(for: part.role, baseRotX: part.baseRotX,
+                                      swing: swing, amount: amount,
+                                      headPitch: headPitch, flap: flap)
+            enc.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
+            for (tex, mesh) in part.submeshes {
+                enc.setFragmentTexture(model.textures[tex], index: 0)
+                enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
+                enc.drawIndexedPrimitives(type: .triangle, indexCount: mesh.indexCount,
+                                          indexType: .uint32, indexBuffer: mesh.indexBuffer,
+                                          indexBufferOffset: 0)
+            }
+        }
+    }
+
+    private func updateMobs(dt: Float) {
+        for mob in mobs { mob.update(dt: dt, world: world) }
+        mobs.removeAll { simd_distance($0.pos, player.pos) > 110 || $0.pos.y < -20 }
+
+        mobSpawnTimer -= dt
+        guard mobSpawnTimer <= 0 else { return }
+        mobSpawnTimer = 0.4
+        if mobs.count < 26 { attemptMobSpawn() }
+    }
+
+    /// One spawn attempt per tick: pick a random surface spot near the player
+    /// and roll a mob that fits the ground there. Failures just wait for the
+    /// next tick, so the population drifts toward the cap instead of jumping.
+    private func attemptMobSpawn() {
+        let angle = Float.random(in: 0..<(2 * .pi))
+        let dist = Float.random(in: 14...60)
+        let x = Int((player.pos.x + cos(angle) * dist).rounded(.down))
+        let z = Int((player.pos.z + sin(angle) * dist).rounded(.down))
+        guard world.isGenerated(World.chunkCoord(blockX: x, blockZ: z)) else { return }
+        let h = world.surfaceHeight(x, z)
+        guard h > World.waterLevel, h + 3 < World.height,
+              world.isSolid(x, h, z),
+              world.block(x, h + 1, z) == .air,
+              world.block(x, h + 2, z) == .air else { return }
+
+        let kind: MobKind
+        if Float.random(in: 0...1) < 0.18 {
+            kind = Bool.random() ? .zombie : .creeper
+        } else {
+            let ground = world.block(x, h, z)
+            guard ground == .grass || ground == .snow else { return } // passive mobs graze
+            kind = [.pig, .sheep, .cow, .chicken].randomElement()!
+        }
+        mobs.append(Mob(kind: kind, pos: SIMD3(Float(x) + 0.5, Float(h + 1) + 0.01, Float(z) + 0.5)))
+    }
+
     // MARK: - Chunk streaming
 
     private func streamGeneration() {
@@ -541,6 +699,8 @@ final class Renderer: NSObject, MTKViewDelegate {
             } else {
                 lastSpaceTap = now
             }
+        case Keys.f5:
+            thirdPerson.toggle()
         case Keys.r:
             resetWorld()
         default:
@@ -609,7 +769,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
 
         guard let hud else { return }
-        var text = "  WASD move · Space jump · 2×Space fly · LMB mine · RMB place · 1-9/scroll slots · R new world  "
+        var text = "  WASD move · Space jump · 2×Space fly · F5 view · LMB mine · RMB place · 1-9/scroll slots · R new world  "
         if player.flying {
             text = "  ✈ SPECTATOR — Space up · Shift down  " + text
         }

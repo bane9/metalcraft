@@ -8,7 +8,10 @@ let package = Package(
         .executableTarget(
             name: "Metalcraft",
             path: "Sources/Metalcraft",
-            resources: [.copy("Resources/terrain.png")]
+            resources: [
+                .copy("Resources/terrain.png"),
+                .copy("Resources/mob"),
+            ]
         )
     ]
 )

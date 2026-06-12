@@ -17,6 +17,7 @@ enum Keys {
     static let nine: UInt16 = 25
     static let space: UInt16 = 49
     static let escape: UInt16 = 53
+    static let f5: UInt16 = 96
 }
 
 final class Input {

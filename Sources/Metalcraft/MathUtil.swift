@@ -58,6 +58,16 @@ func rotationXMatrix(_ a: Float) -> simd_float4x4 {
     ))
 }
 
+func rotationZMatrix(_ a: Float) -> simd_float4x4 {
+    let c = cos(a), s = sin(a)
+    return simd_float4x4(columns: (
+        SIMD4<Float>(c, s, 0, 0),
+        SIMD4<Float>(-s, c, 0, 0),
+        SIMD4<Float>(0, 0, 1, 0),
+        SIMD4<Float>(0, 0, 0, 1)
+    ))
+}
+
 func smoothstepf(_ edge0: Float, _ edge1: Float, _ x: Float) -> Float {
     let t = max(0, min(1, (x - edge0) / (edge1 - edge0)))
     return t * t * (3 - 2 * t)
