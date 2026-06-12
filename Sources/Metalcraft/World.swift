@@ -52,7 +52,9 @@ final class World {
     private(set) var chunks: [ChunkCoord: Chunk] = [:]
     var dirtyChunks = Set<ChunkCoord>()
     private var pendingWater = Set<BlockPos>()
-    private var seed: UInt64 = 1
+    /// Immutable and self-contained, so background workers can capture it by
+    /// value and build chunks off the main thread without any locking.
+    private(set) var generator = TerrainGen(seed: 1)
 
     @inline(__always)
     static func chunkCoord(blockX x: Int, blockZ z: Int) -> ChunkCoord {
@@ -60,13 +62,27 @@ final class World {
     }
 
     func reset(seed: UInt64) {
-        self.seed = seed
+        generator = TerrainGen(seed: seed)
         chunks.removeAll()
         dirtyChunks.removeAll()
         pendingWater.removeAll()
     }
 
     func isGenerated(_ c: ChunkCoord) -> Bool { chunks[c] != nil }
+
+    func generateChunk(_ c: ChunkCoord) {
+        guard chunks[c] == nil else { return }
+        chunks[c] = generator.buildChunk(c)
+    }
+
+    /// Adopt a chunk built off-thread; first writer wins.
+    func insertChunk(_ chunk: Chunk, at c: ChunkCoord) {
+        guard chunks[c] == nil else { return }
+        chunks[c] = chunk
+    }
+
+    /// Copy-on-write handle to a chunk's block storage for snapshotting.
+    func chunkBlocks(_ c: ChunkCoord) -> [UInt8]? { chunks[c]?.blocks }
 
     func block(_ x: Int, _ y: Int, _ z: Int) -> Block {
         guard y >= 0 && y < Self.height,
@@ -165,7 +181,12 @@ final class World {
         return Block.flowing(inflow)
     }
 
-    // MARK: - Generation
+}
+
+/// Pure terrain generation: every result is a function of (seed, coords)
+/// only, so a captured copy can build chunks on any thread.
+struct TerrainGen {
+    let seed: UInt64
 
     private func hash01(_ x: Int, _ z: Int, _ salt: UInt64) -> Float {
         var h = seed &+ salt &* 0xD6E8FEB86659FD93
@@ -210,7 +231,7 @@ final class World {
         n += (valueNoise(fx / 42, fz / 42, 1) * 2 - 1) * 14
         n += (valueNoise(fx / 18, fz / 18, 2) * 2 - 1) * 5
         n += (valueNoise(fx / 7, fz / 7, 3) * 2 - 1) * 2
-        return max(4, min(Self.height - 10, 26 + Int((n * amp).rounded())))
+        return max(4, min(World.height - 10, 26 + Int((n * amp).rounded())))
     }
 
     /// A tree is a pure function of (seed, column), so every chunk that a
@@ -226,28 +247,27 @@ final class World {
         }
         guard hash01(x, z, 123) < density else { return nil }
         let h = terrainHeight(x, z)
-        guard h > Self.waterLevel + 1, h + 9 < Self.height, h < Self.stoneLine else { return nil }
+        guard h > World.waterLevel + 1, h + 9 < World.height, h < World.stoneLine else { return nil }
         return (base: h, trunk: 4 + Int(hash01(x, z, 124) * 2))
     }
 
     private func cactusAt(_ x: Int, _ z: Int) -> (base: Int, height: Int)? {
         guard biomeAt(x, z) == .desert, hash01(x, z, 127) < 0.005 else { return nil }
         let h = terrainHeight(x, z)
-        guard h > Self.waterLevel + 1, h + 4 < Self.height else { return nil }
+        guard h > World.waterLevel + 1, h + 4 < World.height else { return nil }
         return (base: h, height: 1 + Int(hash01(x, z, 128) * 2.99))
     }
 
-    func generateChunk(_ c: ChunkCoord) {
-        guard chunks[c] == nil else { return }
+    func buildChunk(_ c: ChunkCoord) -> Chunk {
         let chunk = Chunk()
         let bx = c.x << 4, bz = c.z << 4
 
-        for lz in 0..<Self.chunkSize {
-            for lx in 0..<Self.chunkSize {
+        for lz in 0..<World.chunkSize {
+            for lx in 0..<World.chunkSize {
                 let x = bx + lx, z = bz + lz
                 let h = terrainHeight(x, z)
                 let biome = biomeAt(x, z)
-                let beach = h <= Self.waterLevel + 1
+                let beach = h <= World.waterLevel + 1
                 for y in 0...h {
                     let b: Block
                     if y == 0 {
@@ -257,7 +277,7 @@ final class World {
                     } else if y < h {
                         switch biome {
                         case .desert: b = .sand
-                        case .mountains: b = h >= Self.stoneLine ? .stone : .dirt
+                        case .mountains: b = h >= World.stoneLine ? .stone : .dirt
                         default: b = .dirt
                         }
                     } else if beach {
@@ -267,14 +287,14 @@ final class World {
                         case .desert: b = .sand
                         case .snowy: b = .snow
                         case .mountains:
-                            b = h >= Self.snowLine ? .snow : (h >= Self.stoneLine ? .stone : .grass)
+                            b = h >= World.snowLine ? .snow : (h >= World.stoneLine ? .stone : .grass)
                         default: b = .grass
                         }
                     }
                     chunk.blocks[Chunk.index(lx, y, lz)] = b.rawValue
                 }
-                if h < Self.waterLevel {
-                    for y in (h + 1)...Self.waterLevel {
+                if h < World.waterLevel {
+                    for y in (h + 1)...World.waterLevel {
                         chunk.blocks[Chunk.index(lx, y, lz)] = Block.water.rawValue
                     }
                 }
@@ -290,14 +310,14 @@ final class World {
         // drop their canopy blocks into this chunk. Only cells inside this
         // chunk are written, so ownership is unambiguous across borders.
         let margin = 3
-        for tz in (bz - margin)..<(bz + Self.chunkSize + margin) {
-            for tx in (bx - margin)..<(bx + Self.chunkSize + margin) {
+        for tz in (bz - margin)..<(bz + World.chunkSize + margin) {
+            for tx in (bx - margin)..<(bx + World.chunkSize + margin) {
                 guard let tree = treeAt(tx, tz) else { continue }
 
                 func put(_ wx: Int, _ wy: Int, _ wz: Int, _ b: Block, onlyAir: Bool) {
                     let lx = wx - bx, lz = wz - bz
-                    guard lx >= 0 && lx < Self.chunkSize && lz >= 0 && lz < Self.chunkSize,
-                          wy >= 0 && wy < Self.height else { return }
+                    guard lx >= 0 && lx < World.chunkSize && lz >= 0 && lz < World.chunkSize,
+                          wy >= 0 && wy < World.height else { return }
                     let i = Chunk.index(lx, wy, lz)
                     if onlyAir && chunk.blocks[i] != 0 { return }
                     chunk.blocks[i] = b.rawValue
@@ -319,6 +339,6 @@ final class World {
             }
         }
 
-        chunks[c] = chunk
+        return chunk
     }
 }

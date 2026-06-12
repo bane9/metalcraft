@@ -7,6 +7,43 @@ struct ChunkGeometry {
     var waterIndices: [UInt32] = []
 }
 
+/// Anything the mesher can read terrain from: the live world on the main
+/// thread, or an immutable snapshot on a background worker.
+protocol BlockSource {
+    func block(_ x: Int, _ y: Int, _ z: Int) -> Block
+}
+
+extension World: BlockSource {}
+
+/// Copy-on-write snapshot of a chunk and its eight neighbors. The arrays
+/// share storage with the live chunks; any later main-thread edit copies on
+/// write, so background reads stay consistent without locks.
+struct ChunkSnapshot: BlockSource {
+    private let baseX: Int // block coords of the 3x3 area's min corner
+    private let baseZ: Int
+    private let grids: [[UInt8]?] // indexed [gz * 3 + gx], nil if ungenerated
+
+    init(world: World, center: ChunkCoord) {
+        baseX = (center.x - 1) * World.chunkSize
+        baseZ = (center.z - 1) * World.chunkSize
+        var g: [[UInt8]?] = []
+        for dz in -1...1 {
+            for dx in -1...1 {
+                g.append(world.chunkBlocks(ChunkCoord(x: center.x + dx, z: center.z + dz)))
+            }
+        }
+        grids = g
+    }
+
+    func block(_ x: Int, _ y: Int, _ z: Int) -> Block {
+        guard y >= 0 && y < World.height else { return .air }
+        let lx = x - baseX, lz = z - baseZ
+        guard lx >= 0, lz >= 0, lx < 48, lz < 48,
+              let blocks = grids[(lz >> 4) * 3 + (lx >> 4)] else { return .air }
+        return Block(rawValue: blocks[Chunk.index(lx & 15, y, lz & 15)]) ?? .air
+    }
+}
+
 /// Builds chunk triangle meshes on the CPU: a quad for every visible block
 /// face. Water goes in a separate mesh so it can render in a blended pass.
 /// Vertex layout matches `VIn` in the shader:
@@ -112,7 +149,7 @@ enum Mesher {
     /// corner. Any of them carrying water above pins the corner to full.
     /// Adjacent blocks share corner values, so surfaces interpolate smoothly
     /// between flow levels instead of stepping.
-    static func waterCornerHeight(_ world: World, _ x: Int, _ y: Int, _ z: Int,
+    static func waterCornerHeight(_ world: some BlockSource, _ x: Int, _ y: Int, _ z: Int,
                                   _ cx: Int, _ cz: Int) -> Float {
         var sum: Float = 0
         var count: Float = 0
@@ -131,14 +168,14 @@ enum Mesher {
     /// Face culling uses opacity, not solidity: leaves have see-through holes,
     /// so faces behind them must still render.
     @inline(__always)
-    static func opaqueAt(_ world: World, _ x: Int, _ y: Int, _ z: Int) -> Bool {
+    static func opaqueAt(_ world: some BlockSource, _ x: Int, _ y: Int, _ z: Int) -> Bool {
         if y < 0 { return true }
         if y >= World.height { return false }
         let b = world.block(x, y, z)
         return b != .air && b != .leaves && !b.isWater
     }
 
-    static func buildChunk(world: World, coord: ChunkCoord) -> ChunkGeometry {
+    static func buildChunk(world: some BlockSource, coord: ChunkCoord) -> ChunkGeometry {
         var geo = ChunkGeometry()
         geo.opaqueVertices.reserveCapacity(16384)
         geo.opaqueIndices.reserveCapacity(4096)

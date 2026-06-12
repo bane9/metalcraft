@@ -89,8 +89,21 @@ final class Renderer: NSObject, MTKViewDelegate {
     private let meshRadius = 14
     private let genOffsets: [(Int, Int)]
     private let meshOffsets: [(Int, Int)]
-    private let genBudgetPerFrame = 24
-    private let meshBudgetPerFrame = 10
+
+    // Terrain gen and mesh building run on a concurrent queue; each frame the
+    // main thread integrates finished results and tops the jobs back up,
+    // nearest-first, so the render loop never blocks on world streaming.
+    private let workQueue = DispatchQueue(label: "metalcraft.chunks",
+                                          qos: .userInitiated, attributes: .concurrent)
+    private let resultLock = NSLock()
+    private var finishedChunks: [(epoch: Int, coord: ChunkCoord, chunk: Chunk)] = []
+    private var finishedMeshes: [(epoch: Int, coord: ChunkCoord, mesh: ChunkMesh)] = []
+    private var pendingGen = Set<ChunkCoord>()
+    private var pendingMesh = Set<ChunkCoord>()
+    private var dirtyWhileMeshing = Set<ChunkCoord>()
+    private var epoch = 0 // bumped on world reset; stale results are dropped
+    private let maxGenJobs = max(2, ProcessInfo.processInfo.activeProcessorCount - 2)
+    private let maxMeshJobs = 6
 
     private let skyColor = SIMD4<Float>(0.55, 0.74, 0.95, 1)
     private let waterFogColor = SIMD4<Float>(0.07, 0.20, 0.40, 1)
@@ -199,6 +212,15 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     private func resetWorld() {
+        epoch += 1
+        pendingGen.removeAll()
+        pendingMesh.removeAll()
+        dirtyWhileMeshing.removeAll()
+        resultLock.lock()
+        finishedChunks.removeAll()
+        finishedMeshes.removeAll()
+        resultLock.unlock()
+
         world.reset(seed: UInt64.random(in: 0...UInt64.max))
         meshes.removeAll()
         items.removeAll()
@@ -233,6 +255,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             input.scrollSteps = 0
         }
 
+        integrateFinishedWork()
         streamGeneration()
 
         if input.captured {
@@ -650,23 +673,57 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     // MARK: - Chunk streaming
 
+    /// Adopt chunks and meshes finished by background workers since last frame.
+    private func integrateFinishedWork() {
+        resultLock.lock()
+        let chunks = finishedChunks
+        finishedChunks.removeAll()
+        let built = finishedMeshes
+        finishedMeshes.removeAll()
+        resultLock.unlock()
+
+        for r in chunks {
+            pendingGen.remove(r.coord)
+            guard r.epoch == epoch else { continue }
+            world.insertChunk(r.chunk, at: r.coord)
+        }
+        for m in built {
+            pendingMesh.remove(m.coord)
+            guard m.epoch == epoch else { continue }
+            if dirtyWhileMeshing.remove(m.coord) != nil {
+                rebuildMesh(m.coord) // edited while the job ran; rebuild fresh
+            } else {
+                meshes[m.coord] = m.mesh
+            }
+        }
+    }
+
     private func streamGeneration() {
         let pc = playerChunk
-        // the 3x3 around the player is generated synchronously every frame so
-        // physics and the mining raycast always have real terrain
+        // the 3x3 around the player is generated synchronously so physics and
+        // the mining raycast always have real terrain (no-op once generated)
         for dz in -1...1 {
             for dx in -1...1 {
                 world.generateChunk(ChunkCoord(x: pc.x + dx, z: pc.z + dz))
             }
         }
-        var budget = genBudgetPerFrame
+
+        // top background generation back up, nearest chunks first
+        guard pendingGen.count < maxGenJobs else { return }
+        let gen = world.generator
+        let ep = epoch
         for (dx, dz) in genOffsets {
             let c = ChunkCoord(x: pc.x + dx, z: pc.z + dz)
-            if !world.isGenerated(c) {
-                world.generateChunk(c)
-                budget -= 1
-                if budget == 0 { break }
+            guard !world.isGenerated(c), !pendingGen.contains(c) else { continue }
+            pendingGen.insert(c)
+            workQueue.async { [weak self] in
+                let chunk = gen.buildChunk(c)
+                guard let self else { return }
+                self.resultLock.lock()
+                self.finishedChunks.append((ep, c, chunk))
+                self.resultLock.unlock()
             }
+            if pendingGen.count >= maxGenJobs { break }
         }
     }
 
@@ -678,9 +735,9 @@ final class Renderer: NSObject, MTKViewDelegate {
             && world.isGenerated(ChunkCoord(x: c.x, z: c.z - 1))
     }
 
-    private func rebuildMesh(_ c: ChunkCoord) {
-        let geo = Mesher.buildChunk(world: world, coord: c)
-        let mesh = meshes[c] ?? ChunkMesh()
+    /// MTLDevice is thread-safe, so buffer upload happens wherever the
+    /// geometry was built — main thread for edits, workers for streaming.
+    private func uploadGeometry(_ geo: ChunkGeometry, into mesh: ChunkMesh) {
         mesh.indexCount = geo.opaqueIndices.count
         mesh.vertexBuffer = geo.opaqueVertices.isEmpty ? nil
             : device.makeBuffer(bytes: geo.opaqueVertices, length: geo.opaqueVertices.count * 4)
@@ -691,26 +748,49 @@ final class Renderer: NSObject, MTKViewDelegate {
             : device.makeBuffer(bytes: geo.waterVertices, length: geo.waterVertices.count * 4)
         mesh.waterIndexBuffer = geo.waterIndices.isEmpty ? nil
             : device.makeBuffer(bytes: geo.waterIndices, length: geo.waterIndices.count * 4)
+    }
+
+    private func rebuildMesh(_ c: ChunkCoord) {
+        let geo = Mesher.buildChunk(world: world, coord: c)
+        let mesh = meshes[c] ?? ChunkMesh()
+        uploadGeometry(geo, into: mesh)
         meshes[c] = mesh
     }
 
+    /// Edits remesh synchronously for instant feedback (it's 1-3 chunks). If
+    /// the chunk's first mesh is still being built in the background, remember
+    /// the edit so the stale result gets rebuilt when it lands.
     private func remeshDirtyChunks() {
         guard !world.dirtyChunks.isEmpty else { return }
-        for c in world.dirtyChunks where meshes[c] != nil && neighborsGenerated(c) {
-            rebuildMesh(c)
+        for c in world.dirtyChunks {
+            if meshes[c] != nil && neighborsGenerated(c) {
+                rebuildMesh(c)
+            } else if pendingMesh.contains(c) {
+                dirtyWhileMeshing.insert(c)
+            }
         }
         world.dirtyChunks.removeAll()
     }
 
     private func streamMeshes() {
         let pc = playerChunk
-        var budget = meshBudgetPerFrame
-        for (dx, dz) in meshOffsets {
-            let c = ChunkCoord(x: pc.x + dx, z: pc.z + dz)
-            if meshes[c] == nil && neighborsGenerated(c) {
-                rebuildMesh(c)
-                budget -= 1
-                if budget == 0 { break }
+        if pendingMesh.count < maxMeshJobs {
+            for (dx, dz) in meshOffsets {
+                let c = ChunkCoord(x: pc.x + dx, z: pc.z + dz)
+                guard meshes[c] == nil, !pendingMesh.contains(c), neighborsGenerated(c) else { continue }
+                pendingMesh.insert(c)
+                let snapshot = ChunkSnapshot(world: world, center: c)
+                let ep = epoch
+                workQueue.async { [weak self] in
+                    guard let self else { return }
+                    let geo = Mesher.buildChunk(world: snapshot, coord: c)
+                    let mesh = ChunkMesh()
+                    self.uploadGeometry(geo, into: mesh)
+                    self.resultLock.lock()
+                    self.finishedMeshes.append((ep, c, mesh))
+                    self.resultLock.unlock()
+                }
+                if pendingMesh.count >= maxMeshJobs { break }
             }
         }
         // drop GPU meshes far behind us; chunk data is kept so edits persist
