@@ -316,6 +316,28 @@ enum Mesher {
         return geo
     }
 
+    /// Unit cube inflated just past the block it wraps, textured with one of
+    /// the 10 destroy-stage tiles (row 15 of terrain.png) — the mining crack
+    /// overlay. Packed [x y z u v] for the UI shader; it draws with multiply
+    /// blending, so the gray cracks darken the block's own texture.
+    static func crackCube(stage: Int) -> (vertices: [Float], indices: [UInt32]) {
+        var verts: [Float] = []
+        var indices: [UInt32] = []
+        let t = SIMD2<Float>(Float(min(max(stage, 0), 9)), 15)
+        for d in 0..<6 {
+            let base = UInt32(verts.count / 5)
+            for (ci, corner) in corners[d].enumerated() {
+                let p = corner * 1.004 - SIMD3<Float>(repeating: 0.002)
+                let uv = uvCorners[d][ci]
+                verts.append(contentsOf: [p.x, p.y, p.z,
+                                          (t.x + 0.002 + uv.x * 0.996) / 16,
+                                          (t.y + 0.002 + uv.y * 0.996) / 16])
+            }
+            indices.append(contentsOf: [base, base + 1, base + 2, base, base + 2, base + 3])
+        }
+        return (verts, indices)
+    }
+
     /// A standalone unit cube for one block type, centered on the origin —
     /// used for dropped-item entities and hotbar icons. `faces` selects which
     /// faces to emit (icons only need the three visible in isometric view).

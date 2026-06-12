@@ -27,6 +27,7 @@ final class Input {
     var mouseDX: Float = 0
     var mouseDY: Float = 0
     var leftClicks = 0
+    var leftDown = false // held = progressive mining
     var rightClicks = 0
     var scrollSteps = 0 // hotbar slot cycling
     var captured = false
@@ -71,6 +72,7 @@ final class GameView: MTKView {
             CGAssociateMouseAndMouseCursorPosition(1)
             NSCursor.unhide()
             input.keys.removeAll()
+            input.leftDown = false
         }
     }
 
@@ -86,9 +88,14 @@ final class GameView: MTKView {
             input.guiLeftClicks.append(convert(event.locationInWindow, from: nil))
         } else if input.captured {
             input.leftClicks += 1
+            input.leftDown = true
         } else {
             setCaptured(true)
         }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        input.leftDown = false
     }
 
     override func rightMouseDown(with event: NSEvent) {

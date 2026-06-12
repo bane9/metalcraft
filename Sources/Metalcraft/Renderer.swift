@@ -57,6 +57,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     let uiPipeline: MTLRenderPipelineState
     let uiTexPipeline: MTLRenderPipelineState
     let cloudPipeline: MTLRenderPipelineState
+    let crackPipeline: MTLRenderPipelineState
     let depthOn: MTLDepthStencilState
     let depthReadOnly: MTLDepthStencilState
     let depthOff: MTLDepthStencilState
@@ -84,6 +85,12 @@ final class Renderer: NSObject, MTKViewDelegate {
     private lazy var playerModel = buildModel(MobModels.humanoid(), textureNames: ["char"])
     private var mobSpawnTimer: Float = 0
     private var thirdPerson = false
+
+    // progressive mining: the block being held under the crosshair and its
+    // 0-1 break progress; resets when the button lifts or the target changes
+    private var breakingPos: SIMD3<Int32>?
+    private var breakingProgress: Float = 0
+    private var crackMeshCache: [Int: CubeMesh] = [:]
 
     let gui = GUIState()
     var furnaces: [BlockPos: FurnaceState] = [:]
@@ -131,7 +138,8 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         let library = try! device.makeLibrary(source: shaderSource, options: nil)
 
-        func makePipeline(vertex: String, fragment: String, blended: Bool) -> MTLRenderPipelineState {
+        func makePipeline(vertex: String, fragment: String, blended: Bool,
+                          multiply: Bool = false) -> MTLRenderPipelineState {
             let desc = MTLRenderPipelineDescriptor()
             desc.vertexFunction = library.makeFunction(name: vertex)
             desc.fragmentFunction = library.makeFunction(name: fragment)
@@ -146,6 +154,18 @@ final class Renderer: NSObject, MTKViewDelegate {
                 ca.sourceAlphaBlendFactor = .one
                 ca.destinationAlphaBlendFactor = .oneMinusSourceAlpha
             }
+            if multiply {
+                // 2 × src × dst, like the GL_DST_COLOR/GL_SRC_COLOR blend the
+                // real game uses for the crack overlay: gray texels darken
+                // the block's texture instead of painting over it
+                ca.isBlendingEnabled = true
+                ca.rgbBlendOperation = .add
+                ca.alphaBlendOperation = .add
+                ca.sourceRGBBlendFactor = .destinationColor
+                ca.destinationRGBBlendFactor = .sourceColor
+                ca.sourceAlphaBlendFactor = .zero
+                ca.destinationAlphaBlendFactor = .one
+            }
             desc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
             return try! device.makeRenderPipelineState(descriptor: desc)
         }
@@ -155,6 +175,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         uiPipeline = makePipeline(vertex: "line_vertex", fragment: "line_fragment", blended: true)
         uiTexPipeline = makePipeline(vertex: "ui_vertex", fragment: "ui_fragment", blended: true)
         cloudPipeline = makePipeline(vertex: "cloud_vertex", fragment: "cloud_fragment", blended: true)
+        crackPipeline = makePipeline(vertex: "ui_vertex", fragment: "ui_fragment",
+                                     blended: false, multiply: true)
 
         func makeDepthState(compare: MTLCompareFunction, write: Bool) -> MTLDepthStencilState {
             let d = MTLDepthStencilDescriptor()
@@ -321,10 +343,9 @@ final class Renderer: NSObject, MTKViewDelegate {
                         }
                     }
                 }
-            } else {
-                mine(hit)
             }
         }
+        updateMining(hit, dt: dt)
         if input.rightClicks > 0 { rightClick(hit) }
         input.leftClicks = 0
         input.rightClicks = 0
@@ -526,6 +547,24 @@ final class Renderer: NSObject, MTKViewDelegate {
                       headPitch: player.pitch, flap: 0)
         }
         enc.setFragmentTexture(atlas, index: 0) // restore for the passes below
+
+        // mining crack overlay: destroy-stage tile multiplied over the block
+        if let bp = breakingPos, breakingProgress > 0 {
+            let stage = min(Int(breakingProgress * 10), 9)
+            let mesh = crackMesh(stage: stage)
+            let blockPos = SIMD3<Float>(Float(bp.x), Float(bp.y), Float(bp.z))
+            var cu = LineUniforms(mvp: viewProj * translationMatrix(blockPos),
+                                  color: SIMD4(1, 1, 1, 1))
+            enc.setRenderPipelineState(crackPipeline)
+            enc.setDepthStencilState(depthReadOnly)
+            enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
+            enc.setVertexBytes(&cu, length: MemoryLayout<LineUniforms>.stride, index: 1)
+            enc.setFragmentBytes(&cu, length: MemoryLayout<LineUniforms>.stride, index: 1)
+            enc.drawIndexedPrimitives(type: .triangle, indexCount: mesh.indexCount,
+                                      indexType: .uint32, indexBuffer: mesh.indexBuffer,
+                                      indexBufferOffset: 0)
+            enc.setDepthStencilState(depthOn)
+        }
 
         // targeted-block outline
         if let hit {
@@ -969,6 +1008,18 @@ final class Renderer: NSObject, MTKViewDelegate {
         return mesh
     }
 
+    /// One of the 10 destroy-stage overlay cubes, built lazily and cached.
+    private func crackMesh(stage: Int) -> CubeMesh {
+        if let cached = crackMeshCache[stage] { return cached }
+        let (verts, indices) = Mesher.crackCube(stage: stage)
+        let mesh = CubeMesh(
+            vertexBuffer: device.makeBuffer(bytes: verts, length: verts.count * 4)!,
+            indexBuffer: device.makeBuffer(bytes: indices, length: indices.count * 4)!,
+            indexCount: indices.count)
+        crackMeshCache[stage] = mesh
+        return mesh
+    }
+
     /// Icon meshes only carry the three faces visible from the fixed
     /// isometric angle (+X, +Y, -Z), so no depth testing is needed.
     private func cubeMesh(for b: Block, icon: Bool) -> CubeMesh {
@@ -1317,6 +1368,49 @@ final class Renderer: NSObject, MTKViewDelegate {
                                Float.random(in: 2.2...3.4),
                                Float.random(in: -1.2...1.2))
         items.append(ItemEntity(item: item, pos: p, vel: vel, count: count))
+    }
+
+    /// Seconds to break a block by hand, or faster with the matching tool —
+    /// the real game's hardness × 1.5, divided by the tool's dig speed.
+    private func breakTime(_ b: Block) -> Float {
+        var speed: Float = 1
+        if case .tool(let type, let material)? = inventory.selectedStack?.item,
+           type == b.preferredTool {
+            speed = material.miningSpeed
+        }
+        return b.hardness * 1.5 / speed
+    }
+
+    /// Progressive mining: holding the button charges the targeted block's
+    /// break progress; the block pops once it reaches 1. Switching targets or
+    /// releasing the button forfeits the progress, like the real game.
+    private func updateMining(_ hit: RayHit?, dt: Float) {
+        guard input.leftDown, input.captured, gui.screen == nil, let hit else {
+            breakingPos = nil
+            breakingProgress = 0
+            return
+        }
+        // a mob in front catches the swing instead of the block behind it
+        let x = Int(hit.block.x), y = Int(hit.block.y), z = Int(hit.block.z)
+        let b = world.block(x, y, z)
+        guard b != .air && b != .bedrock && !b.isWater,
+              nearestMobHit(origin: player.eye, dir: player.forward,
+                            maxDist: min(hit.t, 3.5)) == nil else {
+            breakingPos = nil
+            breakingProgress = 0
+            return
+        }
+        if breakingPos != hit.block {
+            breakingPos = hit.block
+            breakingProgress = 0
+        }
+        let time = breakTime(b)
+        breakingProgress = time <= 0 ? 1 : breakingProgress + dt / time
+        if breakingProgress >= 1 {
+            mine(hit)
+            breakingPos = nil
+            breakingProgress = 0
+        }
     }
 
     private func mine(_ hit: RayHit?) {

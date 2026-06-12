@@ -9,6 +9,17 @@ enum ToolType: Int, Hashable, CaseIterable {
 enum ToolMaterial: Int, Hashable, CaseIterable {
     case wood = 0, stone, iron, diamond, gold
 
+    /// Dig-speed multiplier when the tool matches the block, like the real game.
+    var miningSpeed: Float {
+        switch self {
+        case .wood: return 2
+        case .stone: return 4
+        case .iron: return 6
+        case .diamond: return 8
+        case .gold: return 12
+        }
+    }
+
     var ingredient: Item {
         switch self {
         case .wood: return .block(.planks)
@@ -110,4 +121,36 @@ enum Item: Hashable {
 struct ItemStack {
     var item: Item
     var count: Int
+}
+
+/// Progressive-mining data: Minecraft hardness values and the tool class
+/// that digs each block faster. Bedrock's -1 means unbreakable.
+extension Block {
+    var hardness: Float {
+        switch self {
+        case .air: return 0
+        case .torch: return 0 // pops instantly
+        case .leaves, .snow: return 0.2
+        case .cactus: return 0.4
+        case .dirt, .sand: return 0.5
+        case .grass, .gravel: return 0.6
+        case .stone: return 1.5
+        case .wood, .planks, .cobblestone: return 2
+        case .craftingTable: return 2.5
+        case .coalOre, .ironOre, .goldOre, .diamondOre, .redstoneOre: return 3
+        case .furnace, .furnaceLit: return 3.5
+        case .bedrock: return -1
+        default: return 1
+        }
+    }
+
+    var preferredTool: ToolType? {
+        switch self {
+        case .grass, .dirt, .sand, .gravel, .snow: return .shovel
+        case .stone, .cobblestone, .coalOre, .ironOre, .goldOre,
+             .diamondOre, .redstoneOre, .furnace, .furnaceLit: return .pickaxe
+        case .wood, .planks, .craftingTable: return .axe
+        default: return nil
+        }
+    }
 }

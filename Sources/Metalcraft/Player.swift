@@ -57,7 +57,7 @@ final class Player {
     var yaw: Float = 0
     var pitch: Float = -0.15
     var onGround = false
-    var flying = false // spectator: noclip + free vertical movement
+    var flying = false // spectator: no gravity + free vertical movement
     private var hitWall = false
 
     // walk-cycle phase and 0-1 intensity: drives the first-person view bob
@@ -97,14 +97,17 @@ final class Player {
         if input.keys.contains(Keys.d) { wishDir += right }
 
         if flying {
-            // spectator: glide toward the wish velocity, no gravity, noclip
+            // spectator: glide toward the wish velocity, no gravity, but
+            // still clipped against the world like walking
             var wish = wishDir
             if input.keys.contains(Keys.space) { wish.y += 1 }
             if input.sprint { wish.y -= 1 } // shift descends while flying
             if simd_length_squared(wish) > 0 { wish = simd_normalize(wish) }
             let blend = 1 - exp(-8 * dt)
             vel += (wish * 18 - vel) * blend
-            pos += vel * dt
+            move(axis: 1, by: vel.y * dt, world: world)
+            move(axis: 0, by: vel.x * dt, world: world)
+            move(axis: 2, by: vel.z * dt, world: world)
             onGround = false
             bobAmount *= exp(-6 * dt)
             if pos.y < -64 { spawn(in: world) }
