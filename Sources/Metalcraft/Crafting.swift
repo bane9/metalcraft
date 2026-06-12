@@ -63,6 +63,8 @@ enum Crafting {
         add(&r, [[p, p, p], [p, p, p], [nil, s, nil]], .sign)
         add(&r, [[p, p], [p, p], [p, p]], .doorWood)
         add(&r, [[i, i], [i, i], [i, i]], .doorIron)
+        let w = Item.block(.wool)
+        add(&r, [[w, w, w], [p, p, p]], .bed)
         add(&r, [[i, nil, i], [i, i, i]], .minecart)
         add(&r, [[p, nil, p], [p, p, p]], .boat)
         return r

@@ -60,7 +60,7 @@ enum Item: Hashable {
     case string, feather, gunpowder, redstone, leather
     case porkchopRaw, porkchopCooked
     case bowl, bucket, compass
-    case sign, doorWood, doorIron, minecart, boat
+    case sign, doorWood, doorIron, minecart, boat, bed
     case tool(ToolType, ToolMaterial)
     case armor(ArmorPiece, ArmorMaterial)
 
@@ -96,6 +96,7 @@ enum Item: Hashable {
         case .bucket: return SIMD2(10, 4)
         case .minecart: return SIMD2(7, 8)
         case .boat: return SIMD2(8, 8)
+        case .bed: return SIMD2(13, 2)
         }
     }
 
@@ -127,10 +128,13 @@ struct ItemStack {
 /// that digs each block faster. Bedrock's -1 means unbreakable.
 extension Block {
     var hardness: Float {
+        if isDoor { return isIronDoor ? 5 : 3 }
+        if isBed { return 0.2 }
         switch self {
         case .air: return 0
         case .torch: return 0 // pops instantly
         case .leaves, .snow: return 0.2
+        case .wool: return 0.8
         case .cactus: return 0.4
         case .dirt, .sand: return 0.5
         case .grass, .gravel: return 0.6
@@ -145,6 +149,7 @@ extension Block {
     }
 
     var preferredTool: ToolType? {
+        if isDoor { return isIronDoor ? .pickaxe : .axe }
         switch self {
         case .grass, .dirt, .sand, .gravel, .snow: return .shovel
         case .stone, .cobblestone, .coalOre, .ironOre, .goldOre,

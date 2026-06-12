@@ -3,7 +3,17 @@ import simd
 enum Block: UInt8 {
     case air = 0, grass, dirt, stone, sand, wood, leaves, bedrock, snow, cactus
     case planks = 10, cobblestone, coalOre, ironOre, goldOre, diamondOre, redstoneOre, gravel
-    case craftingTable = 20, furnace, furnaceLit, torch
+    case craftingTable = 20, furnace, furnaceLit, torch, wool
+    // doors encode their state in the raw value: base + facing(bits 0-1)
+    // + open(bit 2) + top half(bit 3); wood at 32-47, iron at 48-63
+    case doorWood0 = 32, doorWood1, doorWood2, doorWood3, doorWood4, doorWood5
+    case doorWood6, doorWood7, doorWood8, doorWood9, doorWood10, doorWood11
+    case doorWood12, doorWood13, doorWood14, doorWood15
+    case doorIron0 = 48, doorIron1, doorIron2, doorIron3, doorIron4, doorIron5
+    case doorIron6, doorIron7, doorIron8, doorIron9, doorIron10, doorIron11
+    case doorIron12, doorIron13, doorIron14, doorIron15
+    // beds: 64 + facing(bits 0-1, foot→head direction) + head half(bit 2)
+    case bed0 = 64, bed1, bed2, bed3, bed4, bed5, bed6, bed7
     // water cases stay contiguous at the end: source, then flowing levels 1-7
     case water = 100, flow1, flow2, flow3, flow4, flow5, flow6, flow7
 }
@@ -11,8 +21,53 @@ enum Block: UInt8 {
 extension Block {
     var isWater: Bool { rawValue >= Block.water.rawValue }
 
+    // MARK: Doors and beds (state packed into the raw value)
+
+    /// The four cardinal directions doors and beds face: 0:-Z 1:+X 2:+Z 3:-X.
+    static let cardinal: [SIMD3<Int32>] = [
+        SIMD3(0, 0, -1), SIMD3(1, 0, 0), SIMD3(0, 0, 1), SIMD3(-1, 0, 0),
+    ]
+
+    var isDoor: Bool { rawValue >= 32 && rawValue < 64 }
+    var isIronDoor: Bool { rawValue >= 48 && rawValue < 64 }
+    var doorFacing: Int { Int(rawValue & 3) }
+    var doorOpen: Bool { rawValue & 4 != 0 }
+    var doorTop: Bool { rawValue & 8 != 0 }
+    static func door(iron: Bool, facing: Int, open: Bool, top: Bool) -> Block {
+        Block(rawValue: (iron ? 48 : 32) | UInt8(facing & 3)
+            | (open ? 4 : 0) | (top ? 8 : 0))!
+    }
+
+    var isBed: Bool { rawValue >= 64 && rawValue < 72 }
+    var bedFacing: Int { Int(rawValue & 3) } // foot → head direction
+    var bedHead: Bool { rawValue & 4 != 0 }
+    static func bed(facing: Int, head: Bool) -> Block {
+        Block(rawValue: 64 | UInt8(facing & 3) | (head ? 4 : 0))!
+    }
+
+    /// The edge a door's panel currently stands against (swung when open).
+    var doorEdge: Int { doorOpen ? (doorFacing + 1) & 3 : doorFacing }
+
+    /// Collision box in block-local 0-1 coordinates; nil = walk-through.
+    /// Doors collide as their 3px panel, beds as a 9px slab.
+    var collisionBox: (lo: SIMD3<Float>, hi: SIMD3<Float>)? {
+        if self == .air || isWater || self == .torch { return nil }
+        if isDoor {
+            let t: Float = 3.0 / 16
+            switch doorEdge {
+            case 0: return (SIMD3(0, 0, 0), SIMD3(1, 1, t))
+            case 1: return (SIMD3(1 - t, 0, 0), SIMD3(1, 1, 1))
+            case 2: return (SIMD3(0, 0, 1 - t), SIMD3(1, 1, 1))
+            default: return (SIMD3(0, 0, 0), SIMD3(t, 1, 1))
+            }
+        }
+        if isBed { return (SIMD3(0, 0, 0), SIMD3(1, 9.0 / 16, 1)) }
+        return (SIMD3(0, 0, 0), SIMD3(1, 1, 1))
+    }
+
     /// Light lost per propagation step: 1 = clear, 16 = fully blocks light.
     var lightOpacity: UInt8 {
+        if isDoor || isBed { return 1 } // doors have windows, beds are low
         switch self {
         case .air, .torch: return 1
         case .leaves: return 2
@@ -121,7 +176,21 @@ final class World {
             return true // ungenerated terrain blocks movement until it streams in
         }
         let b = Block(rawValue: chunk.blocks[Chunk.index(x & 15, y, z & 15)]) ?? .air
+        if b.isDoor { return !b.doorOpen } // open doors don't block the cell
         return b != .air && !b.isWater && b != .torch
+    }
+
+    /// World-space collision box of the cell's block, nil if passable.
+    /// Out-of-world and ungenerated cells block as full cubes, like isSolid.
+    func collisionBox(_ x: Int, _ y: Int, _ z: Int) -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
+        let cell = SIMD3<Float>(Float(x), Float(y), Float(z))
+        let full = (cell, cell + SIMD3<Float>(1, 1, 1))
+        if y < 0 { return full }
+        if y >= Self.height { return nil }
+        guard let chunk = chunks[Self.chunkCoord(blockX: x, blockZ: z)] else { return full }
+        let b = Block(rawValue: chunk.blocks[Chunk.index(x & 15, y, z & 15)]) ?? .air
+        guard let box = b.collisionBox else { return nil }
+        return (cell + box.lo, cell + box.hi)
     }
 
     /// Copy-on-write handle to a chunk's light storage for snapshotting.

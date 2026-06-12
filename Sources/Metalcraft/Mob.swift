@@ -61,7 +61,7 @@ enum MobKind: CaseIterable, Hashable {
         case .cow: return [(.leather, 2)]
         case .pig: return [(.porkchopRaw, 2)]
         case .creeper: return [(.gunpowder, 2)]
-        case .sheep: return []
+        case .sheep: return [(.block(.wool), 2)]
         }
     }
 }
@@ -214,19 +214,22 @@ final class Mob {
         for y in y0...y1 {
             for z in z0...z1 {
                 for x in x0...x1 {
-                    guard world.isSolid(x, y, z) else { continue }
+                    guard let box = world.collisionBox(x, y, z),
+                          mn.x < box.max.x, mx.x > box.min.x,
+                          mn.y < box.max.y, mx.y > box.min.y,
+                          mn.z < box.max.z, mx.z > box.min.z else { continue }
                     switch axis {
                     case 0:
-                        pos.x = amount > 0 ? Float(x) - half - eps : Float(x + 1) + half + eps
+                        pos.x = amount > 0 ? box.min.x - half - eps : box.max.x + half + eps
                     case 1:
                         if amount > 0 {
-                            pos.y = Float(y) - kind.height - eps
+                            pos.y = box.min.y - kind.height - eps
                         } else {
-                            pos.y = Float(y + 1) + eps
+                            pos.y = box.max.y + eps
                             onGround = true
                         }
                     default:
-                        pos.z = amount > 0 ? Float(z) - half - eps : Float(z + 1) + half + eps
+                        pos.z = amount > 0 ? box.min.z - half - eps : box.max.z + half + eps
                     }
                     if axis != 1 { hitWall = true }
                     vel[axis] = 0

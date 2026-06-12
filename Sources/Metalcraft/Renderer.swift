@@ -1540,9 +1540,31 @@ final class Renderer: NSObject, MTKViewDelegate {
         let x = Int(hit.block.x), y = Int(hit.block.y), z = Int(hit.block.z)
         let b = world.block(x, y, z)
         guard b != .air && b != .bedrock && !b.isWater else { return }
+        let center = SIMD3<Float>(Float(x) + 0.5, Float(y) + 0.4, Float(z) + 0.5)
+
+        // doors and beds break as a unit and drop their item
+        if b.isDoor {
+            let oy = b.doorTop ? y - 1 : y + 1
+            world.setBlock(x, y, z, .air)
+            if world.block(x, oy, z).isDoor { world.setBlock(x, oy, z, .air) }
+            remeshUrgent(x, z)
+            spawnDrop(b.isIronDoor ? .doorIron : .doorWood, at: center)
+            return
+        }
+        if b.isBed {
+            let d = Block.cardinal[b.bedFacing]
+            let ox = x + Int(d.x) * (b.bedHead ? -1 : 1)
+            let oz = z + Int(d.z) * (b.bedHead ? -1 : 1)
+            world.setBlock(x, y, z, .air)
+            if world.block(ox, y, oz).isBed { world.setBlock(ox, y, oz, .air) }
+            remeshUrgent(x, z)
+            remeshUrgent(ox, oz)
+            spawnDrop(.bed, at: center)
+            return
+        }
+
         world.setBlock(x, y, z, .air)
         remeshUrgent(x, z)
-        let center = SIMD3<Float>(Float(x) + 0.5, Float(y) + 0.4, Float(z) + 0.5)
         // a mined furnace spills whatever it held
         if b == .furnace || b == .furnaceLit,
            let f = furnaces.removeValue(forKey: BlockPos(x: x, y: y, z: z)) {
@@ -1566,14 +1588,49 @@ final class Renderer: NSObject, MTKViewDelegate {
             let pos = BlockPos(x: x, y: y, z: z)
             if furnaces[pos] == nil { furnaces[pos] = FurnaceState() }
             openGUI(.furnace(pos))
+        case let b where b.isDoor:
+            toggleDoor(x, y, z, b)
+        case let b where b.isBed:
+            sleep()
         default:
             place(hit)
         }
     }
 
+    /// Both door halves swing together.
+    private func toggleDoor(_ x: Int, _ y: Int, _ z: Int, _ b: Block) {
+        let open = !b.doorOpen
+        world.setBlock(x, y, z, .door(iron: b.isIronDoor, facing: b.doorFacing,
+                                      open: open, top: b.doorTop))
+        let oy = b.doorTop ? y - 1 : y + 1
+        let other = world.block(x, oy, z)
+        if other.isDoor {
+            world.setBlock(x, oy, z, .door(iron: other.isIronDoor, facing: other.doorFacing,
+                                           open: open, top: other.doorTop))
+        }
+        remeshUrgent(x, z)
+    }
+
+    /// Clicking a bed at night skips straight to morning, like the real game.
+    private func sleep() {
+        let isNight = timeOfDay > 0.74 || timeOfDay < 0.24
+        guard isNight else { return }
+        timeOfDay = 0.26 // just after sunrise
+    }
+
     private func place(_ hit: RayHit?) {
-        guard let hit, let stack = inventory.selectedStack,
-              let block = stack.item.asBlock else { return }
+        guard let hit, let stack = inventory.selectedStack else { return }
+        switch stack.item {
+        case .doorWood, .doorIron:
+            placeDoor(hit, iron: stack.item == .doorIron)
+            return
+        case .bed:
+            placeBed(hit)
+            return
+        default:
+            break
+        }
+        guard let block = stack.item.asBlock else { return }
         let p = hit.block &+ hit.normal
         let x = Int(p.x), y = Int(p.y), z = Int(p.z)
         let target = world.block(x, y, z)
@@ -1583,18 +1640,73 @@ final class Renderer: NSObject, MTKViewDelegate {
             // torches need solid ground and have no collision box
             guard world.isSolid(x, y - 1, z) else { return }
         } else {
-            // don't place a block inside the player
-            let bmin = SIMD3<Float>(Float(x), Float(y), Float(z))
-            let bmax = bmin + SIMD3<Float>(1, 1, 1)
-            let (pmin, pmax) = player.aabb
-            let overlaps = pmin.x < bmax.x && pmax.x > bmin.x
-                && pmin.y < bmax.y && pmax.y > bmin.y
-                && pmin.z < bmax.z && pmax.z > bmin.z
-            guard !overlaps || player.flying else { return }
+            guard !overlapsPlayer([(x, y, z)]) || player.flying else { return }
         }
 
         world.setBlock(x, y, z, block)
         remeshUrgent(x, z)
+        _ = inventory.consumeSelected()
+    }
+
+    private func overlapsPlayer(_ cells: [(Int, Int, Int)]) -> Bool {
+        let (pmin, pmax) = player.aabb
+        for (x, y, z) in cells {
+            let bmin = SIMD3<Float>(Float(x), Float(y), Float(z))
+            let bmax = bmin + SIMD3<Float>(1, 1, 1)
+            if pmin.x < bmax.x && pmax.x > bmin.x
+                && pmin.y < bmax.y && pmax.y > bmin.y
+                && pmin.z < bmax.z && pmax.z > bmin.z { return true }
+        }
+        return false
+    }
+
+    /// The cardinal direction the player faces, as a Block.cardinal index.
+    private func playerFacing(toward: Bool) -> Int {
+        let fwd = SIMD2<Float>(sin(player.yaw), -cos(player.yaw))
+        var best: Float = -2
+        var facing = 0
+        for (i, d) in Block.cardinal.enumerated() {
+            let dot = (fwd.x * Float(d.x) + fwd.y * Float(d.z)) * (toward ? 1 : -1)
+            if dot > best {
+                best = dot
+                facing = i
+            }
+        }
+        return facing
+    }
+
+    /// Doors fill two cells over solid ground; the panel sits flush with the
+    /// edge the player is facing from.
+    private func placeDoor(_ hit: RayHit, iron: Bool) {
+        let p = hit.block &+ hit.normal
+        let x = Int(p.x), y = Int(p.y), z = Int(p.z)
+        let lower = world.block(x, y, z), upper = world.block(x, y + 1, z)
+        guard lower == .air || lower.isWater, upper == .air || upper.isWater,
+              world.isSolid(x, y - 1, z),
+              !overlapsPlayer([(x, y, z), (x, y + 1, z)]) else { return }
+        let facing = playerFacing(toward: false)
+        world.setBlock(x, y, z, .door(iron: iron, facing: facing, open: false, top: false))
+        world.setBlock(x, y + 1, z, .door(iron: iron, facing: facing, open: false, top: true))
+        remeshUrgent(x, z)
+        _ = inventory.consumeSelected()
+    }
+
+    /// Beds lie flat across two cells: foot in the clicked cell, head one
+    /// cell further along the player's facing.
+    private func placeBed(_ hit: RayHit) {
+        let p = hit.block &+ hit.normal
+        let x = Int(p.x), y = Int(p.y), z = Int(p.z)
+        let facing = playerFacing(toward: true)
+        let d = Block.cardinal[facing]
+        let hx = x + Int(d.x), hz = z + Int(d.z)
+        let foot = world.block(x, y, z), head = world.block(hx, y, hz)
+        guard foot == .air || foot.isWater, head == .air || head.isWater,
+              world.isSolid(x, y - 1, z), world.isSolid(hx, y - 1, hz),
+              !overlapsPlayer([(x, y, z), (hx, y, hz)]) else { return }
+        world.setBlock(x, y, z, .bed(facing: facing, head: false))
+        world.setBlock(hx, y, hz, .bed(facing: facing, head: true))
+        remeshUrgent(x, z)
+        remeshUrgent(hx, hz)
         _ = inventory.consumeSelected()
     }
 

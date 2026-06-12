@@ -120,6 +120,7 @@ enum Mesher {
         case .redstoneOre: return SIMD2(3, 3)
         case .gravel: return SIMD2(3, 1)
         case .torch: return SIMD2(0, 5)
+        case .wool: return SIMD2(0, 4)
         case .craftingTable:
             if dir == 2 { return SIMD2(11, 2) }
             if dir == 3 { return SIMD2(4, 0) }
@@ -211,6 +212,99 @@ enum Mesher {
              tipUV, SIMD3(0, 1, 0))
     }
 
+    /// One quad of a sub-block box, flat-lit by the cell's light. Local UVs
+    /// are clamped into the given 16px tile.
+    private static func boxQuad(_ verts: inout [Float], _ indices: inout [UInt32],
+                                _ ps: [SIMD3<Float>], _ uvs: [SIMD2<Float>],
+                                tile: SIMD2<Float>, n: SIMD3<Float>,
+                                origin: SIMD3<Float>, light: SIMD2<Float>) {
+        let base = UInt32(verts.count / floatsPerVertex)
+        for (p, uv) in zip(ps, uvs) {
+            verts.append(contentsOf: [
+                origin.x + p.x, origin.y + p.y, origin.z + p.z,
+                n.x, n.y, n.z,
+                (tile.x + 0.002 + min(max(uv.x, 0), 1) * 0.996) / 16,
+                (tile.y + 0.002 + min(max(uv.y, 0), 1) * 0.996) / 16,
+                1, 1, 1, light.x, light.y,
+            ])
+        }
+        indices.append(contentsOf: [base, base + 1, base + 2, base, base + 2, base + 3])
+    }
+
+    /// Box spanning lo..hi inside one block; each face's UVs project its
+    /// extents onto the tile so partial boxes sample matching texture slices.
+    /// `tileFor` picks a face's tile, or nil to skip the face.
+    static func appendBox(_ verts: inout [Float], _ indices: inout [UInt32],
+                          lo: SIMD3<Float>, hi: SIMD3<Float>,
+                          origin: SIMD3<Float>, light: SIMD2<Float>,
+                          tileFor: (Int) -> SIMD2<Float>?) {
+        let size = hi - lo
+        for d in 0..<6 {
+            guard let tile = tileFor(d) else { continue }
+            let ps = corners[d].map { lo + $0 * size }
+            let uvs = ps.map { p -> SIMD2<Float> in
+                switch d {
+                case 0, 1: return SIMD2(p.z, 1 - p.y)
+                case 4, 5: return SIMD2(p.x, 1 - p.y)
+                default: return SIMD2(p.x, p.z)
+                }
+            }
+            boxQuad(&verts, &indices, ps, uvs, tile: tile, n: normals[d],
+                    origin: origin, light: light)
+        }
+    }
+
+    /// Doors: a 3px-thick panel standing against one cell edge — the placed
+    /// facing when closed, swung onto the hinge-side edge when open.
+    static func appendDoor(_ verts: inout [Float], _ indices: inout [UInt32],
+                           block b: Block, origin: SIMD3<Float>, light: SIMD2<Float>) {
+        let t: Float = 3.0 / 16
+        let edge = b.doorEdge
+        let tile = SIMD2<Float>(b.isIronDoor ? 2 : 1, b.doorTop ? 5 : 6)
+        var lo = SIMD3<Float>(0, 0, 0)
+        var hi = SIMD3<Float>(1, 1, 1)
+        switch edge {
+        case 0: hi.z = t
+        case 1: lo.x = 1 - t
+        case 2: lo.z = 1 - t
+        default: hi.x = t
+        }
+        appendBox(&verts, &indices, lo: lo, hi: hi, origin: origin, light: light) { _ in tile }
+    }
+
+    /// Beds: a 9px-tall mattress box. Each half shows its own top, side and
+    /// end tiles; the face joining the two halves is skipped.
+    static func appendBed(_ verts: inout [Float], _ indices: inout [UInt32],
+                          block b: Block, origin: SIMD3<Float>, light: SIMD2<Float>) {
+        let h: Float = 9.0 / 16
+        let f = b.bedFacing
+        let topTile = SIMD2<Float>(b.bedHead ? 7 : 6, 8)
+        let sideTile = SIMD2<Float>(b.bedHead ? 7 : 6, 9)
+        let endTile = SIMD2<Float>(b.bedHead ? 8 : 5, 9)
+        // cardinal index → mesher face dir (0:+X 1:-X 2:+Y 3:-Y 4:+Z 5:-Z)
+        let faceOf = [5, 0, 4, 1]
+        let endFace = faceOf[b.bedHead ? f : (f + 2) & 3] // outward end
+        let innerFace = faceOf[b.bedHead ? (f + 2) & 3 : f] // hidden joint
+
+        let lo = SIMD3<Float>(0, 0, 0), hi = SIMD3<Float>(1, h, 1)
+        appendBox(&verts, &indices, lo: lo, hi: hi, origin: origin, light: light) { d in
+            if d == 3 { return SIMD2(4, 0) } // planks underside
+            if d == 2 { return nil } // top is drawn separately, rotated
+            if d == innerFace { return nil }
+            return d == endFace ? endTile : sideTile
+        }
+
+        // top face with UVs rotated so the pillow points along the facing
+        let ps = corners[2].map { SIMD3($0.x, h, $0.z) }
+        let uvs = ps.map { p -> SIMD2<Float> in
+            var uv = SIMD2(p.x, p.z)
+            for _ in 0..<f { uv = SIMD2(1 - uv.y, uv.x) } // 90° per step
+            return uv
+        }
+        boxQuad(&verts, &indices, ps, uvs, tile: topTile, n: SIMD3(0, 1, 0),
+                origin: origin, light: light)
+    }
+
     /// Minecraft-style sloped water: a top corner's height is the average of
     /// the water surface heights of the up-to-4 water cells sharing that
     /// corner. Any of them carrying water above pins the corner to full.
@@ -238,6 +332,7 @@ enum Mesher {
         if y >= World.height { return false }
         let b = snap.block(x, y, z)
         return b != .air && b != .leaves && b != .torch && !b.isWater
+            && !b.isDoor && !b.isBed
     }
 
     // MARK: - Chunk meshing
@@ -278,6 +373,16 @@ enum Mesher {
                     if b == .torch {
                         appendTorch(&geo.opaqueVertices, &geo.opaqueIndices,
                                     origin: origin, light: snap.light(x, y, z))
+                        continue
+                    }
+                    if b.isDoor {
+                        appendDoor(&geo.opaqueVertices, &geo.opaqueIndices,
+                                   block: b, origin: origin, light: snap.light(x, y, z))
+                        continue
+                    }
+                    if b.isBed {
+                        appendBed(&geo.opaqueVertices, &geo.opaqueIndices,
+                                  block: b, origin: origin, light: snap.light(x, y, z))
                         continue
                     }
 
