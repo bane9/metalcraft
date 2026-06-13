@@ -90,7 +90,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var mobModelCache: [MobKind: MobModel] = [:]
     private var textureCache: [String: MTLTexture] = [:]
     private lazy var playerModel = buildModel(MobModels.humanoid(), textureNames: ["char"])
-    private var mobSpawnTimer: Float = 0
+    // Minecraft-style spawn cycles: hostiles try constantly, animals rarely
+    private var hostileSpawnAccum: Float = 0
+    private var passiveSpawnAccum: Float = 0
     private var thirdPerson = false
 
     // progressive mining: the block being held under the crosshair and its
@@ -308,7 +310,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         inventory.clear()
         breakingPos = nil
         breakingProgress = 0
-        mobSpawnTimer = 0
+        hostileSpawnAccum = 0
+        passiveSpawnAccum = 9 // animals appear shortly after entering a world
         autosaveAccum = 0
     }
 
@@ -1463,16 +1466,28 @@ final class Renderer: NSObject, MTKViewDelegate {
             }
         }
 
+        // despawn rules like the real game: anything past 128 blocks goes
+        // immediately; hostiles loitering past 32 blocks roll a slow random
+        // despawn (1-in-800 per tick ≈ 2.5%/s)
         mobs.removeAll {
-            ($0.dead && $0.deathTime > 1.6)
-                || simd_distance($0.pos, player.pos) > 110
-                || $0.pos.y < -20
+            if ($0.dead && $0.deathTime > 1.6) || $0.pos.y < -20 { return true }
+            let d = simd_distance($0.pos, player.pos)
+            if d > 128 { return true }
+            if $0.kind.hostile && d > 32 && Float.random(in: 0..<1) < dt * 0.025 { return true }
+            return false
         }
 
-        mobSpawnTimer -= dt
-        guard mobSpawnTimer <= 0 else { return }
-        mobSpawnTimer = 0.4
-        if mobs.count < 26 { attemptMobSpawn() }
+        // hostile packs try every couple of ticks, animals every 20 seconds
+        hostileSpawnAccum += dt
+        if hostileSpawnAccum >= 0.1 {
+            hostileSpawnAccum = 0
+            attemptPackSpawn(hostile: true)
+        }
+        passiveSpawnAccum += dt
+        if passiveSpawnAccum >= 10 {
+            passiveSpawnAccum = 0
+            attemptPackSpawn(hostile: false)
+        }
     }
 
     /// Creeper fuse: lights within striking range, pulses red while burning,
@@ -1536,30 +1551,79 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
-    /// One spawn attempt per tick: pick a random surface spot near the player
-    /// and roll a mob that fits the ground there. Failures just wait for the
-    /// next tick, so the population drifts toward the cap instead of jumping.
-    private func attemptMobSpawn() {
-        let angle = Float.random(in: 0..<(2 * .pi))
-        let dist = Float.random(in: 14...60)
-        let x = Int((player.pos.x + cos(angle) * dist).rounded(.down))
-        let z = Int((player.pos.z + sin(angle) * dist).rounded(.down))
-        guard world.isGenerated(World.chunkCoord(blockX: x, blockZ: z)) else { return }
-        let h = world.surfaceHeight(x, z)
-        guard h > World.waterLevel, h + 3 < World.height,
-              world.isSolid(x, h, z),
-              world.block(x, h + 1, z) == .air,
-              world.block(x, h + 2, z) == .air else { return }
+    // Minecraft spawning: hostiles cap higher than passives, mobs arrive in
+    // packs of up to 4 of one kind, hostiles need darkness (light ≤ 7 after
+    // the time-of-day skylight subtraction, so caves by day and anywhere by
+    // night), animals need lit grass, and nothing appears within 24 blocks
+    // of the player.
+    private let hostileCap = 40
+    private let passiveCap = 12
 
-        let kind: MobKind
-        if Float.random(in: 0...1) < 0.18 {
-            kind = Bool.random() ? .zombie : .creeper
-        } else {
-            let ground = world.block(x, h, z)
-            guard ground == .grass || ground == .snow else { return } // passive mobs graze
-            kind = [.pig, .sheep, .cow, .chicken].randomElement()!
+    /// Skylight levels lost to the night right now — the same subtraction
+    /// the shader applies, recomputed here for spawn checks.
+    private var skyDarken: Float {
+        let dayBright = max(0, min(1, cos((timeOfDay - 0.5) * 2 * .pi) * 2 + 0.5))
+        return (1 - dayBright) * 11
+    }
+
+    /// Light 0-15 the way a mob experiences it: block light, or skylight
+    /// dimmed by the time of day, whichever is brighter.
+    private func spawnLight(_ x: Int, _ y: Int, _ z: Int) -> Float {
+        let l = world.lightAt(x, y, z)
+        return max(l.y, l.x - skyDarken)
+    }
+
+    /// Whether a 1×2 mob can spawn standing at (x, y, z).
+    private func canSpawn(hostile: Bool, _ x: Int, _ y: Int, _ z: Int) -> Bool {
+        guard y > 0, y + 1 < World.height,
+              world.isGenerated(World.chunkCoord(blockX: x, blockZ: z)) else { return false }
+        // a full opaque block underfoot, two clear dry cells above it
+        let ground = world.block(x, y - 1, z)
+        guard ground.occludes else { return false }
+        let feet = world.block(x, y, z), head = world.block(x, y + 1, z)
+        guard feet.noCollision, !feet.isWater, head.noCollision, !head.isWater
+        else { return false }
+        let p = SIMD3<Float>(Float(x) + 0.5, Float(y), Float(z) + 0.5)
+        guard simd_distance(p, player.pos) >= 24 else { return false }
+        return hostile
+            ? spawnLight(x, y, z) <= 7
+            : ground == .grass && spawnLight(x, y, z) >= 9
+    }
+
+    /// One spawn cycle. The real game rolls one pack attempt per loaded
+    /// chunk per cycle (~hundreds); a few dozen random columns approximate
+    /// that. Hostile pack centers roll any depth so caves populate (and the
+    /// surface, when the random y lands on it at night); animals only live
+    /// on the surface, so their centers go straight to the heightmap. Most
+    /// attempts fail a check somewhere, which is what keeps the population
+    /// drifting toward the cap instead of jumping.
+    private func attemptPackSpawn(hostile: Bool) {
+        var count = mobs.filter { $0.kind.hostile == hostile && !$0.dead }.count
+        let cap = hostile ? hostileCap : passiveCap
+
+        for _ in 0..<(hostile ? 30 : 60) where count < cap {
+            let cx = Int(player.pos.x.rounded(.down)) + Int.random(in: -112...112)
+            let cz = Int(player.pos.z.rounded(.down)) + Int.random(in: -112...112)
+            guard world.isGenerated(World.chunkCoord(blockX: cx, blockZ: cz)) else { continue }
+            let cy = hostile ? Int.random(in: 1..<(World.height - 1))
+                             : world.surfaceHeight(cx, cz) + 1
+
+            let kind: MobKind = hostile
+                ? (Bool.random() ? .zombie : .creeper)
+                : [.pig, .sheep, .cow, .chicken].randomElement()!
+
+            var spawned = 0
+            for _ in 0..<12 where spawned < 4 && count + spawned < cap {
+                let x = cx + Int.random(in: -8...8)
+                let z = cz + Int.random(in: -8...8)
+                let y = hostile ? cy : world.surfaceHeight(x, z) + 1 // packs follow hills
+                guard canSpawn(hostile: hostile, x, y, z) else { continue }
+                mobs.append(Mob(kind: kind,
+                                pos: SIMD3(Float(x) + 0.5, Float(y) + 0.01, Float(z) + 0.5)))
+                spawned += 1
+            }
+            count += spawned
         }
-        mobs.append(Mob(kind: kind, pos: SIMD3(Float(x) + 0.5, Float(h + 1) + 0.01, Float(z) + 0.5)))
     }
 
     // MARK: - Chunk streaming
