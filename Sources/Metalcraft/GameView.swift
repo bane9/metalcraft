@@ -32,6 +32,7 @@ final class Input {
     var scrollSteps = 0 // hotbar slot cycling
     var captured = false
     var sprint = false
+    var sprintTap = false // latched by double-tapping W, until W lifts
 
     // GUI mode: the cursor is released and clicks route to the open screen
     var guiOpen = false
@@ -73,6 +74,7 @@ final class GameView: MTKView {
             NSCursor.unhide()
             input.keys.removeAll()
             input.leftDown = false
+            input.sprintTap = false
         }
     }
 

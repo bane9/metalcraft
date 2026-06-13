@@ -133,7 +133,8 @@ final class Player {
             if input.sprint { wish.y -= 1 } // shift descends while flying
             if simd_length_squared(wish) > 0 { wish = simd_normalize(wish) }
             let blend = 1 - exp(-8 * dt)
-            vel += (wish * 18 - vel) * blend
+            let flySpeed: Float = input.sprintTap ? 27 : 18 // 2×W boosts flight too
+            vel += (wish * flySpeed - vel) * blend
             move(axis: 1, by: vel.y * dt, world: world)
             move(axis: 0, by: vel.x * dt, world: world)
             move(axis: 2, by: vel.z * dt, world: world)
@@ -164,7 +165,7 @@ final class Player {
         let drag: Float = onGround ? 10 : (inWater ? 5 : 0.4)
         hvel *= exp(-drag * dt)
         if simd_length_squared(wishDir) > 0 {
-            let targetSpeed: Float = inWater ? 3.4 : (input.sprint ? 7.8 : 4.8)
+            let targetSpeed: Float = inWater ? 3.4 : (input.sprint || input.sprintTap ? 7.8 : 4.8)
             let currentSpeed = simd_dot(hvel, wishDir)
             let addSpeed = targetSpeed - currentSpeed
             if addSpeed > 0 {

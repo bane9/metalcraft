@@ -104,6 +104,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var aspect: Float = 16.0 / 9.0
     private var lastTime = CACurrentMediaTime()
     private var lastSpaceTap: CFTimeInterval = -10
+    private var lastWTap: CFTimeInterval = -10
+    private var sprintFovBlend: Float = 0 // 0-1, eases the sprint FOV kick in/out
     private var waterTickAccum: Float = 0
     private var redstoneTickAccum: Float = 0
     private var primedTNT: [BlockPos: Float] = [:] // fuse seconds remaining
@@ -491,6 +493,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         integrateFinishedWork()
         streamGeneration()
 
+        if !input.keys.contains(Keys.w) { input.sprintTap = false }
         if input.captured && !paused {
             player.update(dt: dt, input: input, world: world)
         }
@@ -640,7 +643,13 @@ final class Renderer: NSObject, MTKViewDelegate {
               let cmd = queue.makeCommandBuffer(),
               let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
 
-        let proj = perspectiveMatrix(fovY: 85 * .pi / 180, aspect: aspect, near: 0.05, far: 600)
+        // sprint widens the FOV slightly (like the real game) so the speed
+        // change reads instantly; eased both ways so it never pops
+        let sprinting = input.captured && !paused && input.keys.contains(Keys.w)
+            && (input.sprintTap || (input.sprint && !player.flying))
+        sprintFovBlend += ((sprinting ? 1 : 0) - sprintFovBlend) * (1 - exp(-10 * dt))
+        let fov = (85 + 10 * sprintFovBlend) * Float.pi / 180
+        let proj = perspectiveMatrix(fovY: fov, aspect: aspect, near: 0.05, far: 600)
         let viewM = lookAtMatrix(eye: eye, center: eye + player.forward, up: SIMD3(0, 1, 0))
         let viewProj = proj * viewM
 
@@ -1725,6 +1734,13 @@ final class Renderer: NSObject, MTKViewDelegate {
             } else {
                 lastSpaceTap = now
             }
+        case Keys.w:
+            if now - lastWTap < 0.35 {
+                input.sprintTap = true // held until W lifts
+                lastWTap = -10
+            } else {
+                lastWTap = now
+            }
         case Keys.f5:
             thirdPerson.toggle()
         default:
@@ -2073,7 +2089,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     private func updateHUD(view: MTKView) {
         guard let hud else { return }
         hud.isHidden = menu.screen != nil
-        var text = "  WASD move · Space jump · 2×Space fly · E inventory · F5 view · LMB mine · RMB place/use · Esc menu  "
+        var text = "  WASD move · 2×W sprint · Space jump · 2×Space fly · E inventory · F5 view · LMB mine · RMB place/use · Esc menu  "
         if gui.screen != nil {
             text = "  ▸ Click slots to move items · right-click splits · E/Esc closes  "
         } else if player.flying {
