@@ -623,6 +623,32 @@ final class World {
 
 }
 
+/// Deterministic sequence generator for cave carving: every draw is a pure
+/// function of (seed, chunk) and the draw count, so any chunk replaying a
+/// neighbor's caves consumes the identical sequence.
+private struct CaveRand {
+    private var s: UInt64
+
+    init(_ seed: UInt64, _ x: Int, _ z: Int) {
+        s = seed &+ 0xCA7E_5EED_0000_0001
+        s ^= UInt64(bitPattern: Int64(x)) &* 0xBF58476D1CE4E5B9
+        s ^= UInt64(bitPattern: Int64(z)) &* 0x94D049BB133111EB
+        _ = next()
+        _ = next()
+    }
+
+    mutating func next() -> UInt64 {
+        s &+= 0x9E3779B97F4A7C15
+        var z = s
+        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+        return z ^ (z >> 31)
+    }
+
+    mutating func float() -> Float { Float(next() & 0xFFFFFF) * (1.0 / 16777216.0) }
+    mutating func int(_ n: Int) -> Int { n <= 0 ? 0 : Int(next() % UInt64(n)) }
+}
+
 /// Pure terrain generation: every result is a function of (seed, coords)
 /// only, so a captured copy can build chunks on any thread.
 struct TerrainGen {
@@ -762,6 +788,8 @@ struct TerrainGen {
             }
         }
 
+        carveCaves(into: chunk, at: c)
+
         // Scan a margin around the chunk so trees rooted in neighbors still
         // drop their canopy blocks into this chunk. Only cells inside this
         // chunk are written, so ownership is unambiguous across borders.
@@ -797,6 +825,96 @@ struct TerrainGen {
 
         computeInitialLight(chunk)
         return chunk
+    }
+
+    // MARK: - Caves (beta-style worm carvers)
+
+    /// Blocks a tunnel may eat through — terrain and ores, never bedrock,
+    /// water or vegetation.
+    private static let carvableRaw: Set<UInt8> = {
+        let blocks: [Block] = [.grass, .dirt, .stone, .sand, .snow, .gravel,
+                               .coalOre, .ironOre, .goldOre, .diamondOre, .redstoneOre]
+        return Set(blocks.map(\.rawValue))
+    }()
+
+    /// Each chunk in a radius around this one re-rolls its cave systems from
+    /// a per-chunk deterministic RNG; tunnels carve freely through space but
+    /// only cells inside this chunk are written, so caves cross chunk
+    /// borders seamlessly. About 1 in 15 chunks roots a system, like beta.
+    private func carveCaves(into chunk: Chunk, at c: ChunkCoord) {
+        let range = 5 // chunks; comfortably beyond the longest tunnel's reach
+        for ox in (c.x - range)...(c.x + range) {
+            for oz in (c.z - range)...(c.z + range) {
+                var rng = CaveRand(seed, ox, oz)
+                guard rng.int(15) == 0 else { continue }
+                for _ in 0..<(1 + rng.int(2)) {
+                    let sx = Float(ox << 4) + rng.float() * 16
+                    let sy = Float(6 + rng.int(rng.int(40) + 8)) // depth-biased
+                    let sz = Float(oz << 4) + rng.float() * 16
+                    for _ in 0..<(1 + rng.int(3)) {
+                        carveTunnel(into: chunk, at: c, rng: &rng, x: sx, y: sy, z: sz)
+                    }
+                }
+            }
+        }
+    }
+
+    /// One wandering worm: the heading drifts each step, the radius swells
+    /// toward the middle of the run, and roughly 3 of 4 steps carve.
+    private func carveTunnel(into chunk: Chunk, at c: ChunkCoord, rng: inout CaveRand,
+                             x: Float, y: Float, z: Float) {
+        var px = x, py = y, pz = z
+        var yaw = rng.float() * 2 * .pi
+        var pitch = (rng.float() - 0.5) * 0.25
+        var yawDrift: Float = 0
+        var pitchDrift: Float = 0
+        let girth = 1.0 + rng.float() * 1.6
+        let wide: Float = rng.int(10) == 0 ? 2 : 1 // the occasional cavern
+        let length = 30 + rng.int(50)
+        for step in 0..<length {
+            let swell = sin(Float(step) / Float(length) * .pi)
+            px += cos(yaw) * cos(pitch)
+            pz += sin(yaw) * cos(pitch)
+            py += sin(pitch)
+            pitch = pitch * 0.72 + pitchDrift * 0.05
+            yaw += yawDrift * 0.05
+            pitchDrift = pitchDrift * 0.9 + (rng.float() - rng.float()) * 2
+            yawDrift = yawDrift * 0.75 + (rng.float() - rng.float()) * 4
+            if rng.int(4) != 0 {
+                carveSphere(into: chunk, at: c,
+                            cx: px, cy: py, cz: pz, r: (1.3 + swell * girth) * wide)
+            }
+        }
+    }
+
+    /// Hollow a vertically squashed sphere, clipped to this chunk. Cells
+    /// directly beneath water stay put so ocean and pond floors hold.
+    private func carveSphere(into chunk: Chunk, at c: ChunkCoord,
+                             cx: Float, cy: Float, cz: Float, r: Float) {
+        let bx = c.x << 4, bz = c.z << 4
+        let vr = r * 0.75
+        let x0 = max(bx, Int((cx - r).rounded(.down)))
+        let x1 = min(bx + 15, Int((cx + r).rounded(.down)))
+        let y0 = max(1, Int((cy - vr).rounded(.down)))
+        let y1 = min(World.height - 2, Int((cy + vr).rounded(.down)))
+        let z0 = max(bz, Int((cz - r).rounded(.down)))
+        let z1 = min(bz + 15, Int((cz + r).rounded(.down)))
+        guard x0 <= x1, y0 <= y1, z0 <= z1 else { return }
+        for y in y0...y1 {
+            let dy = (Float(y) + 0.5 - cy) / vr
+            for z in z0...z1 {
+                let dz = (Float(z) + 0.5 - cz) / r
+                for x in x0...x1 {
+                    let dx = (Float(x) + 0.5 - cx) / r
+                    guard dx * dx + dy * dy + dz * dz < 1 else { continue }
+                    let i = Chunk.index(x - bx, y, z - bz)
+                    guard Self.carvableRaw.contains(chunk.blocks[i]) else { continue }
+                    let above = Block(rawValue: chunk.blocks[Chunk.index(x - bx, y + 1, z - bz)])
+                    guard above?.isWater != true else { continue }
+                    chunk.blocks[i] = 0
+                }
+            }
+        }
     }
 
     /// Generation-time skylight: per-column fill from the sky, then a flood
