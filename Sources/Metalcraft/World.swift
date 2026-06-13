@@ -1,6 +1,6 @@
 import simd
 
-enum Block: UInt8 {
+enum Block: UInt8, Codable {
     case air = 0, grass, dirt, stone, sand, wood, leaves, bedrock, snow, cactus
     case planks = 10, cobblestone, coalOre, ironOre, goldOre, diamondOre, redstoneOre, gravel
     case craftingTable = 20, furnace, furnaceLit, torch, wool
@@ -148,7 +148,7 @@ struct ChunkCoord: Hashable {
     var z: Int
 }
 
-struct BlockPos: Hashable {
+struct BlockPos: Hashable, Codable {
     var x: Int
     var y: Int
     var z: Int
@@ -178,6 +178,9 @@ final class World {
 
     private(set) var chunks: [ChunkCoord: Chunk] = [:]
     var dirtyChunks = Set<ChunkCoord>()
+    /// Chunks whose blocks diverge from pure generation (player edits, water
+    /// flow, redstone). Only these need to be written to a save file.
+    private(set) var editedChunks = Set<ChunkCoord>()
     private var pendingWater = Set<BlockPos>()
     private var pendingRedstone = Set<BlockPos>()
     private var redstoneOpenDoors = Set<BlockPos>() // doors held open by power
@@ -194,6 +197,7 @@ final class World {
         generator = TerrainGen(seed: seed)
         chunks.removeAll()
         dirtyChunks.removeAll()
+        editedChunks.removeAll()
         pendingWater.removeAll()
         pendingRedstone.removeAll()
         redstoneOpenDoors.removeAll()
@@ -212,6 +216,15 @@ final class World {
         guard chunks[c] == nil else { return }
         chunks[c] = chunk
         reconcileLight(c)
+    }
+
+    /// Adopt a chunk restored from a save: blocks and light come back exactly
+    /// as written (light was globally consistent at save time), so no
+    /// reconciliation against the generator is needed. Restored chunks stay
+    /// marked as edited so later saves keep carrying them.
+    func restoreChunk(_ chunk: Chunk, at c: ChunkCoord) {
+        chunks[c] = chunk
+        editedChunks.insert(c)
     }
 
     /// Copy-on-write handle to a chunk's block storage for snapshotting.
@@ -413,6 +426,7 @@ final class World {
         guard let chunk = chunks[cc] else { return }
         let old = Block(rawValue: chunk.blocks[Chunk.index(x & 15, y, z & 15)]) ?? .air
         chunk.blocks[Chunk.index(x & 15, y, z & 15)] = b.rawValue
+        editedChunks.insert(cc)
         dirtyChunks.insert(cc)
         let lx = x & 15, lz = z & 15
         if lx == 0 { dirtyChunks.insert(ChunkCoord(x: cc.x - 1, z: cc.z)) }

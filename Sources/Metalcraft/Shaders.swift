@@ -142,7 +142,7 @@ vertex UIVOut ui_vertex(uint vid [[vertex_id]],
     return out;
 }
 
-constexpr sampler ui_sampler(mag_filter::nearest, min_filter::nearest);
+constexpr sampler ui_sampler(mag_filter::nearest, min_filter::nearest, address::repeat);
 
 fragment float4 ui_fragment(UIVOut in [[stage_in]],
                             constant LineUniforms &u [[buffer(1)]],

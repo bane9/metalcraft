@@ -124,17 +124,10 @@ final class GameView: MTKView {
     }
 
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == Keys.escape {
-            if input.guiOpen {
-                // the renderer closes the open screen and recaptures
-                if !event.isARepeat { input.pressed.append(event.keyCode) }
-            } else {
-                setCaptured(false)
-            }
-            return
-        }
+        // Escape is always edge-triggered and never a held key: the renderer
+        // decides whether it closes a screen, pauses, or navigates a menu.
         if !event.isARepeat { input.pressed.append(event.keyCode) }
-        input.keys.insert(event.keyCode)
+        if event.keyCode != Keys.escape { input.keys.insert(event.keyCode) }
     }
 
     override func keyUp(with event: NSEvent) {

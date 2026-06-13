@@ -74,7 +74,14 @@ final class Renderer: NSObject, MTKViewDelegate {
     let input: Input
     weak var hud: NSTextField?
     weak var gameView: GameView?
-    private var countLabels: [NSTextField] = [] // pooled stack-count overlays
+    var countLabels: [NSTextField] = [] // pooled stack-count overlays
+    var menuLabels: [NSTextField] = []  // pooled menu text overlays
+
+    // main menu / pause state and the save folder of the running world
+    let menu = MenuState()
+    var currentSaveDir: URL?
+    var worldName = ""
+    private var autosaveAccum: Float = 0
 
     private var meshes: [ChunkCoord: ChunkMesh] = [:]
     private var itemMeshCache: [UInt8: CubeMesh] = [:]
@@ -100,7 +107,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var waterTickAccum: Float = 0
     private var redstoneTickAccum: Float = 0
     private var primedTNT: [BlockPos: Float] = [:] // fuse seconds remaining
-    private var plates = Set<BlockPos>() // placed pressure plates to poll
+    var plates = Set<BlockPos>() // placed pressure plates to poll
 
     // chunk streaming: generate a bit beyond what we mesh, so every meshed
     // chunk has all four neighbors available for face culling
@@ -260,7 +267,15 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         super.init()
 
-        resetWorld()
+        // boot to the title screen: the cursor stays free and clicks route
+        // to the menu until a world is started or loaded
+        input.guiOpen = true
+
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.saveIfPlaying()
+        }
     }
 
     private var playerChunk: ChunkCoord {
@@ -268,18 +283,20 @@ final class Renderer: NSObject, MTKViewDelegate {
                          blockZ: Int(player.pos.z.rounded(.down)))
     }
 
-    private func resetWorld() {
+    /// Tear down everything tied to the running world (meshes, entities,
+    /// in-flight chunk jobs). Capture state is left to the caller.
+    private func clearSession() {
         epoch += 1
         pendingGen.removeAll()
         pendingMesh.removeAll()
         dirtyWhileMeshing.removeAll()
+        discardInFlight.removeAll()
         resultLock.lock()
         finishedChunks.removeAll()
         finishedMeshes.removeAll()
         resultLock.unlock()
 
-        if gui.screen != nil { closeGUI() }
-        world.reset(seed: UInt64.random(in: 0...UInt64.max))
+        if gui.screen != nil { _ = gui.close() } // leftovers vanish with the world
         meshes.removeAll()
         items.removeAll()
         mobs.removeAll()
@@ -287,10 +304,142 @@ final class Renderer: NSObject, MTKViewDelegate {
         primedTNT.removeAll()
         plates.removeAll()
         inventory.clear()
+        breakingPos = nil
+        breakingProgress = 0
+        mobSpawnTimer = 0
+        autosaveAccum = 0
+    }
+
+    // MARK: - World lifecycle (new / load / save / quit)
+
+    private func beginPlaying() {
+        menu.screen = nil
+        input.guiOpen = false
+        input.guiLeftClicks.removeAll()
+        input.guiRightClicks.removeAll()
+        gameView?.setCaptured(true)
+    }
+
+    func startNewWorld() {
+        guard let (dir, name) = SaveIO.createSave() else { return }
+        clearSession()
+        currentSaveDir = dir
+        worldName = name
+        world.reset(seed: UInt64.random(in: 0...UInt64.max))
         for dz in -2...2 {
             for dx in -2...2 { world.generateChunk(ChunkCoord(x: dx, z: dz)) }
         }
         player.spawn(in: world)
+        timeOfDay = 0.35
+        beginPlaying()
+        saveCurrentWorld() // the world shows up in Select World right away
+    }
+
+    func loadWorld(_ summary: SaveSummary) {
+        guard let level = SaveIO.readLevel(summary.dir) else { return }
+        clearSession()
+        currentSaveDir = summary.dir
+        worldName = level.name
+        world.reset(seed: level.seed)
+        for (c, chunk) in SaveIO.readChunks(summary.dir) {
+            world.restoreChunk(chunk, at: c)
+        }
+
+        player.spawn(in: world) // resets transient state (air, fall distance…)
+        if level.playerPos.count == 3 {
+            player.pos = SIMD3(level.playerPos[0], level.playerPos[1], level.playerPos[2])
+        }
+        if level.playerVel.count == 3 {
+            player.vel = SIMD3(level.playerVel[0], level.playerVel[1], level.playerVel[2])
+        }
+        player.yaw = level.yaw
+        player.pitch = level.pitch
+        player.health = level.health
+        player.flying = level.flying
+
+        // solid ground around the player before the first physics step
+        let pc = playerChunk
+        for dz in -2...2 {
+            for dx in -2...2 {
+                world.generateChunk(ChunkCoord(x: pc.x + dx, z: pc.z + dz))
+            }
+        }
+
+        var slots = level.inventory
+        if slots.count < Inventory.slotCount {
+            slots += Array(repeating: nil, count: Inventory.slotCount - slots.count)
+        }
+        inventory.slots = Array(slots.prefix(Inventory.slotCount))
+        inventory.selected = max(0, min(Inventory.hotbarCount - 1, level.selectedSlot))
+
+        for f in level.furnaces {
+            let state = FurnaceState()
+            state.input = f.input
+            state.fuel = f.fuel
+            state.output = f.output
+            state.burnLeft = f.burnLeft
+            state.burnTotal = max(f.burnTotal, 0.01)
+            state.cook = f.cook
+            furnaces[f.pos] = state
+        }
+        plates = Set(level.plates)
+        timeOfDay = level.timeOfDay
+        beginPlaying()
+    }
+
+    func saveCurrentWorld() {
+        guard let dir = currentSaveDir else { return }
+        let level = LevelData(
+            name: worldName,
+            seed: world.generator.seed,
+            timeOfDay: timeOfDay,
+            playerPos: [player.pos.x, player.pos.y, player.pos.z],
+            playerVel: [player.vel.x, player.vel.y, player.vel.z],
+            yaw: player.yaw,
+            pitch: player.pitch,
+            health: player.health,
+            flying: player.flying,
+            inventory: inventory.slots,
+            selectedSlot: inventory.selected,
+            furnaces: furnaces.map {
+                FurnaceSave(pos: $0.key, input: $0.value.input, fuel: $0.value.fuel,
+                            output: $0.value.output, burnLeft: $0.value.burnLeft,
+                            burnTotal: $0.value.burnTotal, cook: $0.value.cook)
+            },
+            plates: Array(plates),
+            lastPlayed: Date())
+        SaveIO.writeLevel(level, to: dir)
+        let edited = world.editedChunks.compactMap { c in
+            world.chunks[c].map { (coord: c, chunk: $0) }
+        }
+        SaveIO.writeChunks(edited, to: dir)
+    }
+
+    func saveIfPlaying() {
+        if menu.screen == nil || menu.screen == .pause { saveCurrentWorld() }
+    }
+
+    func openPause() {
+        guard menu.screen == nil else { return }
+        menu.screen = .pause
+        input.guiOpen = true
+        gameView?.setCaptured(false)
+        saveCurrentWorld() // pausing checkpoints, like the real game
+    }
+
+    func resumeGame() {
+        guard menu.screen == .pause else { return }
+        beginPlaying()
+    }
+
+    func quitToTitle() {
+        saveCurrentWorld()
+        clearSession()
+        currentSaveDir = nil
+        worldName = ""
+        menu.screen = .title
+        input.guiOpen = true
+        gameView?.setCaptured(false)
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
@@ -302,42 +451,72 @@ final class Renderer: NSObject, MTKViewDelegate {
         let dt = min(Float(now - lastTime), 0.05)
         lastTime = now
 
+        // front menus (title / select world) replace the frame entirely
+        if let screen = menu.screen, screen != .pause {
+            drawFrontMenu(view: view)
+            return
+        }
+
+        // losing the window mid-game pauses, like the real game
+        if menu.screen == nil && !input.captured && !input.guiOpen {
+            openPause()
+        }
+        if menu.screen == .pause {
+            handleMenuClicks(menuButtons(view.bounds.size), bounds: view.bounds.size)
+            if input.pressed.contains(Keys.escape) { resumeGame() }
+            input.pressed.removeAll()
+            input.scrollSteps = 0
+            // quit-to-title tears the world down mid-frame; skip rendering it
+            if let s = menu.screen, s != .pause { return }
+        }
+        let paused = menu.screen == .pause
+
         if input.captured {
             player.look(dx: input.mouseDX, dy: input.mouseDY)
         }
         input.mouseDX = 0
         input.mouseDY = 0
 
-        for key in input.pressed { handleKeyPress(key, now: now) }
-        input.pressed.removeAll()
-        if input.scrollSteps != 0 {
-            let n = Inventory.hotbarCount
-            inventory.selected = ((inventory.selected + input.scrollSteps) % n + n) % n
-            input.scrollSteps = 0
+        if !paused {
+            for key in input.pressed { handleKeyPress(key, now: now) }
+            input.pressed.removeAll()
+            if input.scrollSteps != 0 {
+                let n = Inventory.hotbarCount
+                inventory.selected = ((inventory.selected + input.scrollSteps) % n + n) % n
+                input.scrollSteps = 0
+            }
+            processGUIClicks(view: view)
         }
-        processGUIClicks(view: view)
 
         integrateFinishedWork()
         streamGeneration()
 
-        if input.captured {
+        if input.captured && !paused {
             player.update(dt: dt, input: input, world: world)
         }
 
-        waterTickAccum += dt
-        if waterTickAccum >= 0.25 {
-            waterTickAccum = 0
-            world.tickWater()
-        }
+        if !paused {
+            waterTickAccum += dt
+            if waterTickAccum >= 0.25 {
+                waterTickAccum = 0
+                world.tickWater()
+            }
 
-        redstoneTickAccum += dt
-        if redstoneTickAccum >= 0.1 {
-            redstoneTickAccum = 0
-            tickRedstone()
+            redstoneTickAccum += dt
+            if redstoneTickAccum >= 0.1 {
+                redstoneTickAccum = 0
+                tickRedstone()
+            }
+
+            autosaveAccum += dt
+            if autosaveAccum >= 60 {
+                autosaveAccum = 0
+                saveCurrentWorld()
+            }
         }
 
         // burning TNT fuses
-        if !primedTNT.isEmpty {
+        if !primedTNT.isEmpty && !paused {
             for (p, t) in primedTNT {
                 let remaining = t - dt
                 if remaining > 0 {
@@ -354,9 +533,10 @@ final class Renderer: NSObject, MTKViewDelegate {
             }
         }
 
-        let hit = raycast(origin: player.eye, dir: player.forward, maxDist: 6, world: world)
+        let hit = paused ? nil
+            : raycast(origin: player.eye, dir: player.forward, maxDist: 6, world: world)
 
-        if input.leftClicks > 0 {
+        if input.leftClicks > 0 && !paused {
             // punch a mob if one is in reach and closer than the targeted block
             let reach = min(hit?.t ?? .infinity, 3.5)
             if let mob = nearestMobHit(origin: player.eye, dir: player.forward, maxDist: reach) {
@@ -375,18 +555,28 @@ final class Renderer: NSObject, MTKViewDelegate {
             }
         }
         updateMining(hit, dt: dt)
-        if input.rightClicks > 0 { rightClick(hit) }
+        if input.rightClicks > 0 && !paused { rightClick(hit) }
         input.leftClicks = 0
         input.rightClicks = 0
 
-        updateItems(dt: dt)
-        updateMobs(dt: dt)
-        tickFurnaces(dt: dt)
+        if !paused {
+            updateItems(dt: dt)
+            updateMobs(dt: dt)
+            tickFurnaces(dt: dt)
+        }
         remeshDirtyChunks()
         streamMeshes()
 
-        // death: everything restarts with a fresh world
-        if player.health <= 0 { resetWorld() }
+        // death: the inventory scatters at the death spot and the player
+        // respawns at the world spawn; the world itself persists
+        if player.health <= 0 && !paused {
+            let deathPos = player.pos + SIMD3<Float>(0, 0.9, 0)
+            for stack in inventory.slots.compactMap({ $0 }) {
+                spawnDrop(stack.item, count: stack.count, at: deathPos)
+            }
+            inventory.clear()
+            player.spawn(in: world)
+        }
 
         // camera: player eye, pulled back in third person, or swaying with
         // the walk cycle in first person
@@ -415,8 +605,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         // dayBright is beta's "celestial brightness" (0 night, 1 day); the
         // shader subtracts skyDarken whole light levels like beta did
         // (midnight surface sits at level 4).
-        timeOfDay = (timeOfDay + dt / dayLength).truncatingRemainder(dividingBy: 1)
-        cloudOffset += dt * 0.6
+        if !paused {
+            timeOfDay = (timeOfDay + dt / dayLength).truncatingRemainder(dividingBy: 1)
+            cloudOffset += dt * 0.6
+        }
         let sunAngle = (timeOfDay - 0.25) * 2 * .pi
         let sunHeight = sin(sunAngle)
         let sunDir = simd_normalize(SIMD3<Float>(cos(sunAngle), sin(sunAngle), 0.18))
@@ -659,7 +851,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         drawHotbar(enc, view: view, baseUniforms: uniforms)
 
-        if gui.screen == nil {
+        if gui.screen == nil && !paused {
             // crosshair, drawn in NDC with depth test off
             enc.setRenderPipelineState(linePipeline)
             enc.setDepthStencilState(depthOff)
@@ -672,7 +864,13 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: 4)
         }
 
-        updateCountLabels(view: view)
+        updateCountLabels(view: view, hidden: paused)
+
+        if paused {
+            updateMenuLabels(view, drawPauseMenu(enc, view: view))
+        } else {
+            updateMenuLabels(view, [])
+        }
 
         enc.endEncoding()
 
@@ -701,25 +899,41 @@ final class Renderer: NSObject, MTKViewDelegate {
     // MARK: - UI (hotbar + container screens)
 
     /// Classic GUI pixel scale: dialog art is 176×166, hotbar 182×22.
-    private let uiScale: CGFloat = 2
+    let uiScale: CGFloat = 2
 
-    private func texture(_ name: String, _ subdirectory: String) -> MTLTexture {
+    func texture(_ name: String, _ subdirectory: String) -> MTLTexture {
         let key = subdirectory + "/" + name
         if let t = textureCache[key] { return t }
         let url = Bundle.module.url(forResource: name, withExtension: "png",
                                     subdirectory: subdirectory)!
-        let t = try! MTKTextureLoader(device: device).newTexture(URL: url, options: [.SRGB: false])
+        let loader = MTKTextureLoader(device: device)
+        let t: MTLTexture
+        if let direct = try? loader.newTexture(URL: url, options: [.SRGB: false]) {
+            t = direct
+        } else {
+            // MTKTextureLoader chokes on some PNGs (e.g. 24-bit without an
+            // alpha channel); redraw through ImageIO into RGBA and load that
+            guard let img = NSImage(contentsOf: url),
+                  let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil),
+                  let ctx = CGContext(data: nil, width: cg.width, height: cg.height,
+                                      bitsPerComponent: 8, bytesPerRow: cg.width * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { fatalError("cannot decode texture \(key)") }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+            t = try! loader.newTexture(cgImage: ctx.makeImage()!, options: [.SRGB: false])
+        }
         textureCache[key] = t
         return t
     }
 
-    private func ndcRect(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat, _ b: CGSize) -> simd_float4x4 {
+    func ndcRect(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat, _ b: CGSize) -> simd_float4x4 {
         translationMatrix(SIMD3(Float(x / b.width) * 2 - 1, Float(y / b.height) * 2 - 1, 0))
             * scaleMatrix(SIMD3(Float(w / b.width) * 2, Float(h / b.height) * 2, 1))
     }
 
-    private func drawSolidQuad(_ enc: MTLRenderCommandEncoder, _ mvp: simd_float4x4,
-                               _ color: SIMD4<Float>) {
+    func drawSolidQuad(_ enc: MTLRenderCommandEncoder, _ mvp: simd_float4x4,
+                       _ color: SIMD4<Float>) {
         enc.setRenderPipelineState(uiPipeline)
         enc.setVertexBuffer(quadBuffer, offset: 0, index: 0)
         var lu = LineUniforms(mvp: mvp, color: color)
@@ -730,9 +944,9 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     /// Blit a pixel region of a 256×256 GUI texture into a view rect.
     /// `rect` is in view points (AppKit y-up).
-    private func drawUIQuad(_ enc: MTLRenderCommandEncoder, texture tex: MTLTexture,
-                            rect: CGRect, srcX: Float, srcY: Float, srcW: Float, srcH: Float,
-                            bounds: CGSize) {
+    func drawUIQuad(_ enc: MTLRenderCommandEncoder, texture tex: MTLTexture,
+                    rect: CGRect, srcX: Float, srcY: Float, srcW: Float, srcH: Float,
+                    bounds: CGSize, tint: SIMD4<Float> = SIMD4(1, 1, 1, 1)) {
         let nx0 = Float(rect.minX / bounds.width) * 2 - 1
         let ny0 = Float(rect.minY / bounds.height) * 2 - 1
         let nx1 = Float(rect.maxX / bounds.width) * 2 - 1
@@ -748,7 +962,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             nx1, ny1, 0, u1, v0,
             nx0, ny1, 0, u0, v0,
         ]
-        var lu = LineUniforms(mvp: matrix_identity_float4x4, color: SIMD4(1, 1, 1, 1))
+        var lu = LineUniforms(mvp: matrix_identity_float4x4, color: tint)
         enc.setRenderPipelineState(uiTexPipeline)
         enc.setFragmentTexture(tex, index: 0)
         enc.setVertexBytes(verts, length: verts.count * 4, index: 0)
@@ -1025,11 +1239,11 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     // MARK: - Stack count labels
 
-    private func updateCountLabels(view: MTKView) {
+    private func updateCountLabels(view: MTKView, hidden: Bool = false) {
         let bounds = view.bounds.size
         var requests: [(text: String, x: CGFloat, y: CGFloat)] = []
 
-        for i in 0..<Inventory.hotbarCount {
+        for i in 0..<(hidden ? 0 : Inventory.hotbarCount) {
             if let stack = inventory.slots[i], stack.count > 1 {
                 let c = hotbarSlotCenter(i, bounds)
                 requests.append(("\(stack.count)", c.x + 8 * uiScale, c.y - 8 * uiScale))
@@ -1498,7 +1712,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         case Keys.e:
             if gui.screen != nil { closeGUI() } else { openGUI(.inventory) }
         case Keys.escape:
-            if gui.screen != nil { closeGUI() }
+            if gui.screen != nil { closeGUI() } else { openPause() }
         case Keys.one, Keys.two, Keys.three, Keys.four, Keys.five,
              Keys.six, Keys.seven, Keys.eight, Keys.nine:
             let order: [UInt16] = [Keys.one, Keys.two, Keys.three, Keys.four, Keys.five,
@@ -1513,8 +1727,6 @@ final class Renderer: NSObject, MTKViewDelegate {
             }
         case Keys.f5:
             thirdPerson.toggle()
-        case Keys.r:
-            resetWorld()
         default:
             break
         }
@@ -1860,7 +2072,8 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     private func updateHUD(view: MTKView) {
         guard let hud else { return }
-        var text = "  WASD move · Space jump · 2×Space fly · E inventory · F5 view · LMB mine · RMB place/use · R new world  "
+        hud.isHidden = menu.screen != nil
+        var text = "  WASD move · Space jump · 2×Space fly · E inventory · F5 view · LMB mine · RMB place/use · Esc menu  "
         if gui.screen != nil {
             text = "  ▸ Click slots to move items · right-click splits · E/Esc closes  "
         } else if player.flying {

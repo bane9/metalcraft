@@ -1,12 +1,12 @@
 import simd
 
 /// Tool rows in items.png start at row 4; the raw value is the row offset.
-enum ToolType: Int, Hashable, CaseIterable {
+enum ToolType: Int, Hashable, CaseIterable, Codable {
     case sword = 0, shovel, pickaxe, axe, hoe
 }
 
 /// Tool columns in items.png; the raw value is the column.
-enum ToolMaterial: Int, Hashable, CaseIterable {
+enum ToolMaterial: Int, Hashable, CaseIterable, Codable {
     case wood = 0, stone, iron, diamond, gold
 
     /// Dig-speed multiplier when the tool matches the block, like the real game.
@@ -32,12 +32,12 @@ enum ToolMaterial: Int, Hashable, CaseIterable {
 }
 
 /// Armor rows 0-3 in items.png; the raw value is the row.
-enum ArmorPiece: Int, Hashable, CaseIterable {
+enum ArmorPiece: Int, Hashable, CaseIterable, Codable {
     case helmet = 0, chestplate, leggings, boots
 }
 
 /// Armor columns in items.png; the raw value is the column.
-enum ArmorMaterial: Int, Hashable, CaseIterable {
+enum ArmorMaterial: Int, Hashable, CaseIterable, Codable {
     case leather = 0, chain, iron, diamond, gold
 
     /// nil = not craftable (chainmail), like the real game
@@ -53,7 +53,7 @@ enum ArmorMaterial: Int, Hashable, CaseIterable {
 }
 
 /// Everything a slot can hold: placeable blocks plus items from items.png.
-enum Item: Hashable {
+enum Item: Hashable, Codable {
     case block(Block)
     case stick, coal, ironIngot, goldIngot, diamond
     case flint, flintAndSteel, bow, arrow, fishingRod
@@ -119,7 +119,7 @@ enum Item: Hashable {
     }
 }
 
-struct ItemStack {
+struct ItemStack: Codable {
     var item: Item
     var count: Int
 }
