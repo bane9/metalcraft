@@ -14,6 +14,14 @@ enum Block: UInt8 {
     case doorIron12, doorIron13, doorIron14, doorIron15
     // beds: 64 + facing(bits 0-1, foot→head direction) + head half(bit 2)
     case bed0 = 64, bed1, bed2, bed3, bed4, bed5, bed6, bed7
+    // redstone: wire carries its 0-15 power level in the raw value;
+    // torches, levers and plates are on/off pairs
+    case wire0 = 72, wire1, wire2, wire3, wire4, wire5, wire6, wire7
+    case wire8, wire9, wire10, wire11, wire12, wire13, wire14, wire15
+    case redstoneTorch = 88, redstoneTorchOff = 89
+    case leverOff = 90, leverOn = 91
+    case plateOff = 92, plateOn = 93
+    case tnt = 94
     // water cases stay contiguous at the end: source, then flowing levels 1-7
     case water = 100, flow1, flow2, flow3, flow4, flow5, flow6, flow7
 }
@@ -48,10 +56,52 @@ extension Block {
     /// The edge a door's panel currently stands against (swung when open).
     var doorEdge: Int { doorOpen ? (doorFacing + 1) & 3 : doorFacing }
 
+    // MARK: Redstone
+
+    var isWire: Bool { rawValue >= 72 && rawValue < 88 }
+    var wireLevel: Int { Int(rawValue) - 72 }
+    static func wire(_ level: Int) -> Block {
+        Block(rawValue: UInt8(72 + max(0, min(15, level))))!
+    }
+    /// Components that emit full power while active.
+    var isRedstoneSource: Bool {
+        self == .redstoneTorch || self == .leverOn || self == .plateOn
+    }
+
+    /// Tiny attachments that entities pass straight through.
+    var noCollision: Bool {
+        self == .air || isWater || self == .torch || isWire
+            || self == .redstoneTorch || self == .redstoneTorchOff
+            || self == .leverOff || self == .leverOn
+            || self == .plateOff || self == .plateOn
+    }
+
+    /// Box the targeting wireframe hugs — the visual shape of partial
+    /// blocks (wire, torches, levers, plates) rather than the whole cell.
+    var outlineBox: (lo: SIMD3<Float>, hi: SIMD3<Float>) {
+        if let box = collisionBox { return box }
+        if isWire { return (SIMD3(0, 0, 0), SIMD3(1, 1.0 / 16, 1)) }
+        switch self {
+        case .torch, .redstoneTorch, .redstoneTorchOff:
+            return (SIMD3(6.0 / 16, 0, 6.0 / 16), SIMD3(10.0 / 16, 10.0 / 16, 10.0 / 16))
+        case .leverOff, .leverOn:
+            return (SIMD3(4.0 / 16, 0, 3.0 / 16), SIMD3(12.0 / 16, 11.0 / 16, 13.0 / 16))
+        case .plateOff, .plateOn:
+            return (SIMD3(1.0 / 16, 0, 1.0 / 16), SIMD3(15.0 / 16, 1.0 / 16, 15.0 / 16))
+        default:
+            return (SIMD3(0, 0, 0), SIMD3(1, 1, 1))
+        }
+    }
+
+    /// Full opaque cube, for face culling and light blocking.
+    var occludes: Bool {
+        !(self == .leaves || isDoor || isBed || noCollision)
+    }
+
     /// Collision box in block-local 0-1 coordinates; nil = walk-through.
     /// Doors collide as their 3px panel, beds as a 9px slab.
     var collisionBox: (lo: SIMD3<Float>, hi: SIMD3<Float>)? {
-        if self == .air || isWater || self == .torch { return nil }
+        if noCollision { return nil }
         if isDoor {
             let t: Float = 3.0 / 16
             switch doorEdge {
@@ -67,9 +117,8 @@ extension Block {
 
     /// Light lost per propagation step: 1 = clear, 16 = fully blocks light.
     var lightOpacity: UInt8 {
-        if isDoor || isBed { return 1 } // doors have windows, beds are low
+        if isDoor || isBed || noCollision { return 1 }
         switch self {
-        case .air, .torch: return 1
         case .leaves: return 2
         default: return isWater ? 3 : 16
         }
@@ -79,6 +128,7 @@ extension Block {
         switch self {
         case .torch: return 14
         case .furnaceLit: return 13
+        case .redstoneTorch: return 7
         default: return 0
         }
     }
@@ -129,6 +179,8 @@ final class World {
     private(set) var chunks: [ChunkCoord: Chunk] = [:]
     var dirtyChunks = Set<ChunkCoord>()
     private var pendingWater = Set<BlockPos>()
+    private var pendingRedstone = Set<BlockPos>()
+    private var redstoneOpenDoors = Set<BlockPos>() // doors held open by power
     /// Immutable and self-contained, so background workers can capture it by
     /// value and build chunks off the main thread without any locking.
     private(set) var generator = TerrainGen(seed: 1)
@@ -143,6 +195,8 @@ final class World {
         chunks.removeAll()
         dirtyChunks.removeAll()
         pendingWater.removeAll()
+        pendingRedstone.removeAll()
+        redstoneOpenDoors.removeAll()
     }
 
     func isGenerated(_ c: ChunkCoord) -> Bool { chunks[c] != nil }
@@ -177,7 +231,7 @@ final class World {
         }
         let b = Block(rawValue: chunk.blocks[Chunk.index(x & 15, y, z & 15)]) ?? .air
         if b.isDoor { return !b.doorOpen } // open doors don't block the cell
-        return b != .air && !b.isWater && b != .torch
+        return !b.noCollision
     }
 
     /// World-space collision box of the cell's block, nil if passable.
@@ -375,6 +429,15 @@ final class World {
         pendingWater.insert(BlockPos(x: x, y: y - 1, z: z))
         pendingWater.insert(BlockPos(x: x, y: y, z: z + 1))
         pendingWater.insert(BlockPos(x: x, y: y, z: z - 1))
+        // and any edit can affect circuits — wires connect diagonally, so
+        // schedule the whole 3×3×3 neighborhood
+        for dy in -1...1 {
+            for dz in -1...1 {
+                for dx in -1...1 {
+                    pendingRedstone.insert(BlockPos(x: x + dx, y: y + dy, z: z + dz))
+                }
+            }
+        }
     }
 
     func surfaceHeight(_ x: Int, _ z: Int) -> Int {
@@ -382,6 +445,113 @@ final class World {
             return y
         }
         return 0
+    }
+
+    // MARK: - Redstone simulation
+    // Cell-centric like the water: every scheduled cell recomputes what it
+    // should be from its neighbors, and changes reschedule the neighborhood.
+    // Wire levels strictly relax toward the fixed point, so it converges.
+
+    /// Whether a cell receives redstone power: an adjacent live source or a
+    /// charged wire. A torch never powers its own support block (the torch
+    /// sitting above doesn't count), which is what makes inversion stable.
+    func isPowered(_ x: Int, _ y: Int, _ z: Int) -> Bool {
+        for (i, d) in Self.lightDirs.enumerated() {
+            let b = block(x + d.0, y + d.1, z + d.2)
+            if b == .leverOn || b == .plateOn { return true }
+            if b == .redstoneTorch && i != 2 { return true } // 2 = above
+            if b.isWire && b.wireLevel > 0 { return true }
+        }
+        return false
+    }
+
+    /// Wire relaxation: full power beside a live source, else the strongest
+    /// neighboring wire minus one. Wires connect across one-block steps.
+    private func desiredWireLevel(_ x: Int, _ y: Int, _ z: Int) -> Int {
+        for d in Self.lightDirs where block(x + d.0, y + d.1, z + d.2).isRedstoneSource {
+            return 15
+        }
+        var p = 0
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            for dy in -1...1 {
+                let n = block(x + dx, y + dy, z + dz)
+                if n.isWire { p = max(p, n.wireLevel - 1) }
+            }
+        }
+        return p
+    }
+
+    private func setDoor(_ p: BlockPos, open: Bool) {
+        let b = block(p.x, p.y, p.z)
+        guard b.isDoor else { return }
+        setBlock(p.x, p.y, p.z, .door(iron: b.isIronDoor, facing: b.doorFacing,
+                                      open: open, top: b.doorTop))
+        let t = block(p.x, p.y + 1, p.z)
+        if t.isDoor {
+            setBlock(p.x, p.y + 1, p.z, .door(iron: t.isIronDoor, facing: t.doorFacing,
+                                              open: open, top: t.doorTop))
+        }
+    }
+
+    /// One redstone tick. Wires relax, torches invert (one flip per tick, so
+    /// torch loops make clocks), unsupported parts pop off, powered doors
+    /// open. Returns popped blocks (for drops) and TNT cells to arm.
+    func tickRedstone() -> (pops: [(BlockPos, Block)], primed: [BlockPos]) {
+        var pops: [(BlockPos, Block)] = []
+        var primed: [BlockPos] = []
+        guard !pendingRedstone.isEmpty else { return (pops, primed) }
+        var queue = Array(pendingRedstone)
+        pendingRedstone.removeAll()
+        if queue.count > 4096 {
+            pendingRedstone = Set(queue[4096...])
+            queue = Array(queue[..<4096])
+        }
+        for p in queue {
+            guard p.y >= 0 && p.y < Self.height,
+                  isGenerated(Self.chunkCoord(blockX: p.x, blockZ: p.z)) else { continue }
+            let b = block(p.x, p.y, p.z)
+            switch b {
+            case let w where w.isWire:
+                guard isSolid(p.x, p.y - 1, p.z) else {
+                    setBlock(p.x, p.y, p.z, .air)
+                    pops.append((p, b))
+                    continue
+                }
+                let want = desiredWireLevel(p.x, p.y, p.z)
+                if want != w.wireLevel { setBlock(p.x, p.y, p.z, .wire(want)) }
+            case .redstoneTorch, .redstoneTorchOff:
+                guard isSolid(p.x, p.y - 1, p.z) else {
+                    setBlock(p.x, p.y, p.z, .air)
+                    pops.append((p, b))
+                    continue
+                }
+                let wantOn = !isPowered(p.x, p.y - 1, p.z)
+                if (b == .redstoneTorch) != wantOn {
+                    setBlock(p.x, p.y, p.z, wantOn ? .redstoneTorch : .redstoneTorchOff)
+                }
+            case .leverOff, .leverOn, .plateOff, .plateOn:
+                guard isSolid(p.x, p.y - 1, p.z) else {
+                    setBlock(p.x, p.y, p.z, .air)
+                    pops.append((p, b))
+                    continue
+                }
+            case let d where d.isDoor && !d.doorTop:
+                let powered = isPowered(p.x, p.y, p.z) || isPowered(p.x, p.y + 1, p.z)
+                let held = redstoneOpenDoors.contains(p)
+                if powered && !held {
+                    redstoneOpenDoors.insert(p)
+                    if !d.doorOpen { setDoor(p, open: true) }
+                } else if !powered && held {
+                    redstoneOpenDoors.remove(p)
+                    if block(p.x, p.y, p.z).doorOpen { setDoor(p, open: false) }
+                }
+            case .tnt:
+                if isPowered(p.x, p.y, p.z) { primed.append(p) }
+            default:
+                break
+            }
+        }
+        return (pops, primed)
     }
 
     // MARK: - Water flow simulation

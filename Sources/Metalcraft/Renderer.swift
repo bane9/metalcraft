@@ -98,6 +98,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var lastTime = CACurrentMediaTime()
     private var lastSpaceTap: CFTimeInterval = -10
     private var waterTickAccum: Float = 0
+    private var redstoneTickAccum: Float = 0
+    private var primedTNT: [BlockPos: Float] = [:] // fuse seconds remaining
+    private var plates = Set<BlockPos>() // placed pressure plates to poll
 
     // chunk streaming: generate a bit beyond what we mesh, so every meshed
     // chunk has all four neighbors available for face culling
@@ -281,6 +284,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         items.removeAll()
         mobs.removeAll()
         furnaces.removeAll()
+        primedTNT.removeAll()
+        plates.removeAll()
         inventory.clear()
         for dz in -2...2 {
             for dx in -2...2 { world.generateChunk(ChunkCoord(x: dx, z: dz)) }
@@ -323,6 +328,30 @@ final class Renderer: NSObject, MTKViewDelegate {
         if waterTickAccum >= 0.25 {
             waterTickAccum = 0
             world.tickWater()
+        }
+
+        redstoneTickAccum += dt
+        if redstoneTickAccum >= 0.1 {
+            redstoneTickAccum = 0
+            tickRedstone()
+        }
+
+        // burning TNT fuses
+        if !primedTNT.isEmpty {
+            for (p, t) in primedTNT {
+                let remaining = t - dt
+                if remaining > 0 {
+                    primedTNT[p] = remaining
+                    continue
+                }
+                primedTNT.removeValue(forKey: p)
+                if world.block(p.x, p.y, p.z) == .tnt {
+                    world.setBlock(p.x, p.y, p.z, .air)
+                    remeshUrgent(p.x, p.z)
+                }
+                explode(at: SIMD3(Float(p.x) + 0.5, Float(p.y) + 0.5, Float(p.z) + 0.5),
+                        radius: 3.6)
+            }
         }
 
         let hit = raycast(origin: player.eye, dir: player.forward, maxDist: 6, world: world)
@@ -494,13 +523,13 @@ final class Renderer: NSObject, MTKViewDelegate {
                                   Int(item.pos.z.rounded(.down)))
             iu.lightParams = SIMD4(skyDarken, 1, l.x, l.y)
             let mesh: CubeMesh
-            if let b = item.item.asBlock, b != .torch {
+            if let b = item.item.asBlock, flatBlockIcon(item.item) == nil {
                 iu.model *= scaleMatrix(SIMD3(repeating: 0.25))
                 mesh = cubeMesh(for: b, icon: false)
                 enc.setFragmentTexture(atlas, index: 0)
             } else {
                 mesh = spriteMesh(for: item.item)
-                enc.setFragmentTexture(item.item == .block(.torch) ? atlas : texture("items", "gui"),
+                enc.setFragmentTexture(flatBlockIcon(item.item) != nil ? atlas : texture("items", "gui"),
                                        index: 0)
             }
             enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
@@ -569,11 +598,13 @@ final class Renderer: NSObject, MTKViewDelegate {
             enc.setDepthStencilState(depthOn)
         }
 
-        // targeted-block outline
+        // targeted-block outline, hugging the block's actual shape
         if let hit {
             enc.setRenderPipelineState(linePipeline)
             let blockPos = SIMD3<Float>(Float(hit.block.x), Float(hit.block.y), Float(hit.block.z))
-            var lu = LineUniforms(mvp: viewProj * translationMatrix(blockPos),
+            let box = world.block(Int(hit.block.x), Int(hit.block.y), Int(hit.block.z)).outlineBox
+            var lu = LineUniforms(mvp: viewProj * translationMatrix(blockPos + box.lo)
+                                      * scaleMatrix(box.hi - box.lo),
                                   color: SIMD4(0.05, 0.05, 0.05, 1))
             enc.setVertexBuffer(cubeLineBuffer, offset: 0, index: 0)
             enc.setVertexBytes(&lu, length: MemoryLayout<LineUniforms>.stride, index: 1)
@@ -726,17 +757,27 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
     }
 
+    /// Block items that draw as a flat terrain tile (icons and drops),
+    /// like the real game: torches, redstone torches and levers.
+    private func flatBlockIcon(_ item: Item) -> SIMD2<Float>? {
+        switch item {
+        case .block(.torch): return SIMD2(0, 5)
+        case .block(.redstoneTorch): return SIMD2(3, 6)
+        case .block(.leverOff): return SIMD2(0, 6)
+        default: return nil
+        }
+    }
+
     /// A 16×16 item graphic centered at `center`: blocks as isometric mini
     /// cubes, materials as items.png sprites.
     private func drawItemIcon(_ enc: MTLRenderCommandEncoder, item: Item,
                               center: CGPoint, size: CGFloat,
                               bounds: CGSize, baseUniforms: Uniforms) {
-        if item == .block(.torch) {
-            // torches draw flat from their terrain tile, like the real game
+        if let t = flatBlockIcon(item) {
             drawUIQuad(enc, texture: atlas,
                        rect: CGRect(x: center.x - size / 2, y: center.y - size / 2,
                                     width: size, height: size),
-                       srcX: 0, srcY: 5 * 16, srcW: 16, srcH: 16, bounds: bounds)
+                       srcX: t.x * 16, srcY: t.y * 16, srcW: 16, srcH: 16, bounds: bounds)
         } else if let b = item.asBlock {
             enc.setRenderPipelineState(blockPipeline)
             enc.setFragmentTexture(atlas, index: 0)
@@ -1034,7 +1075,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     /// materials like coal or ingots (and torches, which use the atlas).
     private func spriteMesh(for item: Item) -> CubeMesh {
         if let cached = spriteMeshCache[item] { return cached }
-        let t = item == .block(.torch) ? SIMD2<Float>(0, 5) : (item.sprite ?? SIMD2(0, 0))
+        let t = flatBlockIcon(item) ?? item.sprite ?? SIMD2(0, 0)
         let u0 = (t.x * 16 + 0.1) / 256, u1 = (t.x * 16 + 15.9) / 256
         let v0 = (t.y * 16 + 0.1) / 256, v1 = (t.y * 16 + 15.9) / 256
         let s: Float = 0.26
@@ -1231,10 +1272,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
-    /// Creeper blast: carves a sphere out of the terrain and hurts anything
-    /// nearby with linear distance falloff.
-    private func explode(at c: SIMD3<Float>) {
-        let radius: Float = 2.8
+    /// Explosion (creepers, TNT): carves a sphere out of the terrain and
+    /// hurts anything nearby with linear distance falloff. TNT caught in the
+    /// blast chain-reacts on a short randomized fuse.
+    private func explode(at c: SIMD3<Float>, radius: Float = 2.8) {
         let r = Int(radius.rounded(.up))
         let bx = Int(c.x.rounded(.down)), by = Int(c.y.rounded(.down)), bz = Int(c.z.rounded(.down))
         for y in (by - r)...(by + r) {
@@ -1244,6 +1285,13 @@ final class Renderer: NSObject, MTKViewDelegate {
                     guard simd_distance(center, c) <= radius else { continue }
                     let b = world.block(x, y, z)
                     guard b != .air && b != .bedrock && !b.isWater else { continue }
+                    if b == .tnt {
+                        let key = BlockPos(x: x, y: y, z: z)
+                        if primedTNT[key] == nil {
+                            primedTNT[key] = Float.random(in: 0.3...0.8)
+                        }
+                        continue
+                    }
                     world.setBlock(x, y, z, .air)
                 }
             }
@@ -1472,8 +1520,64 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
+    /// One redstone tick: poll pressure plates against entities, then let
+    /// the world relax its circuits; drops and TNT arming come back to us.
+    private func tickRedstone() {
+        tickPlates()
+        let (pops, primed) = world.tickRedstone()
+        for (p, b) in pops {
+            let center = SIMD3<Float>(Float(p.x) + 0.5, Float(p.y) + 0.4, Float(p.z) + 0.5)
+            if let drop = dropFor(b) {
+                spawnDrop(drop.item, count: drop.count, at: center)
+            }
+        }
+        for p in primed where primedTNT[p] == nil {
+            primedTNT[p] = 1.5
+        }
+    }
+
+    /// A plate is pressed while the player or any live mob stands on it.
+    private func tickPlates() {
+        var stale: [BlockPos] = []
+        for p in plates {
+            let b = world.block(p.x, p.y, p.z)
+            guard b == .plateOff || b == .plateOn else {
+                stale.append(p)
+                continue
+            }
+            let mn = SIMD3<Float>(Float(p.x), Float(p.y), Float(p.z))
+            let mx = mn + SIMD3<Float>(1, 0.25, 1)
+            func overlaps(_ amin: SIMD3<Float>, _ amax: SIMD3<Float>) -> Bool {
+                amin.x < mx.x && amax.x > mn.x && amin.y < mx.y && amax.y > mn.y
+                    && amin.z < mx.z && amax.z > mn.z
+            }
+            let pa = player.aabb
+            var pressed = overlaps(pa.min, pa.max)
+            if !pressed {
+                for m in mobs where !m.dead {
+                    let half = m.kind.halfWidth
+                    if overlaps(m.pos - SIMD3(half, 0, half),
+                                m.pos + SIMD3(half, m.kind.height, half)) {
+                        pressed = true
+                        break
+                    }
+                }
+            }
+            let want: Block = pressed ? .plateOn : .plateOff
+            if b != want {
+                world.setBlock(p.x, p.y, p.z, want)
+                remeshUrgent(p.x, p.z)
+            }
+        }
+        for p in stale { plates.remove(p) }
+    }
+
     private func dropFor(_ b: Block) -> (item: Item, count: Int)? {
+        if b.isWire { return (.redstone, 1) }
         switch b {
+        case .redstoneTorchOff: return (.block(.redstoneTorch), 1)
+        case .leverOn: return (.block(.leverOff), 1)
+        case .plateOn: return (.block(.plateOff), 1)
         case .grass: return (.block(.dirt), 1) // like Minecraft, grass drops dirt
         case .stone: return (.block(.cobblestone), 1)
         case .coalOre: return (.coal, 1)
@@ -1542,6 +1646,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         guard b != .air && b != .bedrock && !b.isWater else { return }
         let center = SIMD3<Float>(Float(x) + 0.5, Float(y) + 0.4, Float(z) + 0.5)
 
+        let pos = BlockPos(x: x, y: y, z: z)
+        if b == .plateOff || b == .plateOn { plates.remove(pos) }
+        primedTNT.removeValue(forKey: pos) // mining lit TNT defuses it
+
         // doors and beds break as a unit and drop their item
         if b.isDoor {
             let oy = b.doorTop ? y - 1 : y + 1
@@ -1592,13 +1700,21 @@ final class Renderer: NSObject, MTKViewDelegate {
             toggleDoor(x, y, z, b)
         case let b where b.isBed:
             sleep()
+        case .leverOff, .leverOn:
+            let b = world.block(x, y, z)
+            world.setBlock(x, y, z, b == .leverOn ? .leverOff : .leverOn)
+            remeshUrgent(x, z)
+        case .tnt where inventory.selectedStack?.item == .flintAndSteel:
+            // lit by hand
+            primedTNT[BlockPos(x: x, y: y, z: z)] = 1.5
         default:
             place(hit)
         }
     }
 
-    /// Both door halves swing together.
+    /// Both door halves swing together. Iron doors only answer to redstone.
     private func toggleDoor(_ x: Int, _ y: Int, _ z: Int, _ b: Block) {
+        guard !b.isIronDoor else { return }
         let open = !b.doorOpen
         world.setBlock(x, y, z, .door(iron: b.isIronDoor, facing: b.doorFacing,
                                       open: open, top: b.doorTop))
@@ -1627,6 +1743,9 @@ final class Renderer: NSObject, MTKViewDelegate {
         case .bed:
             placeBed(hit)
             return
+        case .redstone:
+            placeWire(hit)
+            return
         default:
             break
         }
@@ -1636,14 +1755,26 @@ final class Renderer: NSObject, MTKViewDelegate {
         let target = world.block(x, y, z)
         guard target == .air || target.isWater else { return }
 
-        if block == .torch {
-            // torches need solid ground and have no collision box
+        switch block {
+        case .torch, .redstoneTorch, .leverOff, .plateOff:
+            // floor attachments: need solid ground, have no collision box
             guard world.isSolid(x, y - 1, z) else { return }
-        } else {
+        default:
             guard !overlapsPlayer([(x, y, z)]) || player.flying else { return }
         }
 
         world.setBlock(x, y, z, block)
+        if block == .plateOff { plates.insert(BlockPos(x: x, y: y, z: z)) }
+        remeshUrgent(x, z)
+        _ = inventory.consumeSelected()
+    }
+
+    /// The redstone item lays dust on top of a solid block.
+    private func placeWire(_ hit: RayHit) {
+        let p = hit.block &+ hit.normal
+        let x = Int(p.x), y = Int(p.y), z = Int(p.z)
+        guard world.block(x, y, z) == .air, world.isSolid(x, y - 1, z) else { return }
+        world.setBlock(x, y, z, .wire(0))
         remeshUrgent(x, z)
         _ = inventory.consumeSelected()
     }

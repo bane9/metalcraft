@@ -121,6 +121,11 @@ enum Mesher {
         case .gravel: return SIMD2(3, 1)
         case .torch: return SIMD2(0, 5)
         case .wool: return SIMD2(0, 4)
+        case .tnt:
+            if dir == 2 { return SIMD2(9, 0) }
+            if dir == 3 { return SIMD2(10, 0) }
+            return SIMD2(8, 0)
+        case .plateOff, .plateOn: return SIMD2(1, 0)
         case .craftingTable:
             if dir == 2 { return SIMD2(11, 2) }
             if dir == 3 { return SIMD2(4, 0) }
@@ -180,8 +185,8 @@ enum Mesher {
     /// Classic torch: four full-size quads pinched in around the stick (the
     /// texture's alpha trims them) plus the glowing tip's top face.
     static func appendTorch(_ verts: inout [Float], _ indices: inout [UInt32],
-                            origin: SIMD3<Float>, light: SIMD2<Float>) {
-        let t = SIMD2<Float>(0, 5)
+                            origin: SIMD3<Float>, light: SIMD2<Float>,
+                            tile t: SIMD2<Float> = SIMD2(0, 5)) {
         func quad(_ ps: [SIMD3<Float>], _ uvs: [SIMD2<Float>], _ n: SIMD3<Float>) {
             let base = UInt32(verts.count / floatsPerVertex)
             for (p, uv) in zip(ps, uvs) {
@@ -305,6 +310,105 @@ enum Mesher {
                 origin: origin, light: light)
     }
 
+    /// Redstone dust: a flat quad just above the floor, tinted by its power
+    /// level. Straight runs use the line tile; everything else the cross.
+    static func appendWire(_ verts: inout [Float], _ indices: inout [UInt32],
+                           level: Int, snap: ChunkSnapshot, x: Int, y: Int, z: Int,
+                           origin: SIMD3<Float>, light: SIMD2<Float>) {
+        func connects(_ dx: Int, _ dz: Int) -> Bool {
+            for dy in -1...1 {
+                let n = snap.block(x + dx, y + dy, z + dz)
+                if n.isWire { return true }
+                if dy == 0 && (n.isRedstoneSource || n == .redstoneTorchOff
+                    || n == .leverOff || n == .plateOff) { return true }
+            }
+            return false
+        }
+        let n = connects(0, -1), e = connects(1, 0), s = connects(0, 1), w = connects(-1, 0)
+        let straightEW = (e || w) && !n && !s
+        let straightNS = (n || s) && !e && !w
+        let straight = straightNS || straightEW
+        let tile: SIMD2<Float> = straight ? SIMD2(5, 10) : SIMD2(4, 10)
+
+        // junctions show the cross tile with its unused arms cropped away;
+        // the hub occupies 5-11/16, so quad and uv shrink together
+        var x0: Float = 0, x1: Float = 1, z0: Float = 0, z1: Float = 1
+        if !straight && (n || e || s || w) {
+            if !w { x0 = 5.0 / 16 }
+            if !e { x1 = 11.0 / 16 }
+            if !n { z0 = 5.0 / 16 }
+            if !s { z1 = 11.0 / 16 }
+        }
+
+        // the dust texture is grayscale; power drives the red tint
+        let c = 0.25 + 0.75 * Float(level) / 15
+        let tint = SIMD3<Float>(c, c * 0.15, c * 0.15)
+        let lift: Float = 1.0 / 64
+        let ps: [SIMD3<Float>] = [SIMD3(x0, lift, z0), SIMD3(x0, lift, z1),
+                                  SIMD3(x1, lift, z1), SIMD3(x1, lift, z0)]
+        // the line tile runs east-west; rotate the uvs for north-south runs
+        let uvs: [SIMD2<Float>] = straightNS
+            ? [SIMD2(z0, x0), SIMD2(z1, x0), SIMD2(z1, x1), SIMD2(z0, x1)]
+            : [SIMD2(x0, z0), SIMD2(x0, z1), SIMD2(x1, z1), SIMD2(x1, z0)]
+        let base = UInt32(verts.count / floatsPerVertex)
+        for (p, uv) in zip(ps, uvs) {
+            verts.append(contentsOf: [origin.x + p.x, origin.y + p.y, origin.z + p.z,
+                                      0, 1, 0,
+                                      (tile.x + 0.002 + uv.x * 0.996) / 16,
+                                      (tile.y + 0.002 + uv.y * 0.996) / 16,
+                                      tint.x, tint.y, tint.z,
+                                      light.x, light.y])
+        }
+        indices.append(contentsOf: [base, base + 1, base + 2, base, base + 2, base + 3])
+    }
+
+    /// Lever: a cobblestone base, and the lever-tile handle drawn like a
+    /// torch (pinched crossed quads) sheared to lean with its state.
+    static func appendLever(_ verts: inout [Float], _ indices: inout [UInt32],
+                            on: Bool, origin: SIMD3<Float>, light: SIMD2<Float>) {
+        appendBox(&verts, &indices,
+                  lo: SIMD3(5.0 / 16, 0, 4.0 / 16), hi: SIMD3(11.0 / 16, 3.0 / 16, 12.0 / 16),
+                  origin: origin, light: light) { d in d == 3 ? nil : SIMD2(0, 1) }
+
+        let t = SIMD2<Float>(0, 6)
+        let lean: Float = on ? 0.3 : -0.3
+        let height: Float = 11.0 / 16
+        func quad(_ ps: [SIMD3<Float>], _ uvs: [SIMD2<Float>], _ n: SIMD3<Float>) {
+            let base = UInt32(verts.count / floatsPerVertex)
+            for (p, uv) in zip(ps, uvs) {
+                verts.append(contentsOf: [
+                    origin.x + p.x + lean * p.y, // shear: the tip leans over
+                    origin.y + p.y * height,
+                    origin.z + p.z,
+                    n.x, n.y, n.z,
+                    (t.x + 0.002 + uv.x * 0.996) / 16,
+                    (t.y + 0.002 + uv.y * 0.996) / 16,
+                    1, 1, 1, light.x, light.y,
+                ])
+            }
+            indices.append(contentsOf: [base, base + 1, base + 2, base, base + 2, base + 3])
+        }
+        let sideUV: [SIMD2<Float>] = [SIMD2(0, 1), SIMD2(0, 0), SIMD2(1, 0), SIMD2(1, 1)]
+        let lo: Float = 7.0 / 16, hi: Float = 9.0 / 16
+        quad([SIMD3(lo, 0, 0), SIMD3(lo, 1, 0), SIMD3(lo, 1, 1), SIMD3(lo, 0, 1)],
+             sideUV, SIMD3(-1, 0, 0))
+        quad([SIMD3(hi, 0, 0), SIMD3(hi, 1, 0), SIMD3(hi, 1, 1), SIMD3(hi, 0, 1)],
+             sideUV, SIMD3(1, 0, 0))
+        quad([SIMD3(0, 0, lo), SIMD3(0, 1, lo), SIMD3(1, 1, lo), SIMD3(1, 0, lo)],
+             sideUV, SIMD3(0, 0, -1))
+        quad([SIMD3(0, 0, hi), SIMD3(0, 1, hi), SIMD3(1, 1, hi), SIMD3(1, 0, hi)],
+             sideUV, SIMD3(0, 0, 1))
+    }
+
+    /// Stone pressure plate: a thin pad that sinks while something stands on it.
+    static func appendPlate(_ verts: inout [Float], _ indices: inout [UInt32],
+                            pressed: Bool, origin: SIMD3<Float>, light: SIMD2<Float>) {
+        let h: Float = (pressed ? 0.5 : 1.0) / 16
+        appendBox(&verts, &indices,
+                  lo: SIMD3(1.0 / 16, 0, 1.0 / 16), hi: SIMD3(15.0 / 16, h, 15.0 / 16),
+                  origin: origin, light: light) { d in d == 3 ? nil : SIMD2(1, 0) }
+    }
+
     /// Minecraft-style sloped water: a top corner's height is the average of
     /// the water surface heights of the up-to-4 water cells sharing that
     /// corner. Any of them carrying water above pins the corner to full.
@@ -330,9 +434,7 @@ enum Mesher {
     static func opaqueAt(_ snap: ChunkSnapshot, _ x: Int, _ y: Int, _ z: Int) -> Bool {
         if y < 0 { return true }
         if y >= World.height { return false }
-        let b = snap.block(x, y, z)
-        return b != .air && b != .leaves && b != .torch && !b.isWater
-            && !b.isDoor && !b.isBed
+        return snap.block(x, y, z).occludes
     }
 
     // MARK: - Chunk meshing
@@ -370,9 +472,29 @@ enum Mesher {
                     if b == .air { continue }
                     let origin = SIMD3<Float>(Float(x), Float(y), Float(z))
 
-                    if b == .torch {
+                    if b == .torch || b == .redstoneTorch || b == .redstoneTorchOff {
+                        let tile: SIMD2<Float> = b == .torch ? SIMD2(0, 5)
+                            : (b == .redstoneTorch ? SIMD2(3, 6) : SIMD2(3, 7))
                         appendTorch(&geo.opaqueVertices, &geo.opaqueIndices,
-                                    origin: origin, light: snap.light(x, y, z))
+                                    origin: origin, light: snap.light(x, y, z), tile: tile)
+                        continue
+                    }
+                    if b.isWire {
+                        appendWire(&geo.opaqueVertices, &geo.opaqueIndices,
+                                   level: b.wireLevel, snap: snap, x: x, y: y, z: z,
+                                   origin: origin, light: snap.light(x, y, z))
+                        continue
+                    }
+                    if b == .leverOff || b == .leverOn {
+                        appendLever(&geo.opaqueVertices, &geo.opaqueIndices,
+                                    on: b == .leverOn, origin: origin,
+                                    light: snap.light(x, y, z))
+                        continue
+                    }
+                    if b == .plateOff || b == .plateOn {
+                        appendPlate(&geo.opaqueVertices, &geo.opaqueIndices,
+                                    pressed: b == .plateOn, origin: origin,
+                                    light: snap.light(x, y, z))
                         continue
                     }
                     if b.isDoor {

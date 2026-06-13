@@ -130,7 +130,10 @@ extension Block {
     var hardness: Float {
         if isDoor { return isIronDoor ? 5 : 3 }
         if isBed { return 0.2 }
+        if isWire { return 0 }
         switch self {
+        case .redstoneTorch, .redstoneTorchOff, .tnt: return 0
+        case .leverOff, .leverOn, .plateOff, .plateOn: return 0.5
         case .air: return 0
         case .torch: return 0 // pops instantly
         case .leaves, .snow: return 0.2

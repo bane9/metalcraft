@@ -65,6 +65,14 @@ enum Crafting {
         add(&r, [[i, i], [i, i], [i, i]], .doorIron)
         let w = Item.block(.wool)
         add(&r, [[w, w, w], [p, p, p]], .bed)
+
+        // redstone components
+        let g = Item.gunpowder
+        let sa = Item.block(.sand)
+        add(&r, [[Item.redstone], [s]], .block(.redstoneTorch))
+        add(&r, [[s], [c]], .block(.leverOff))
+        add(&r, [[Item.block(.stone), Item.block(.stone)]], .block(.plateOff))
+        add(&r, [[g, sa, g], [sa, g, sa], [g, sa, g]], .block(.tnt))
         add(&r, [[i, nil, i], [i, i, i]], .minecart)
         add(&r, [[p, nil, p], [p, p, p]], .boat)
         return r
