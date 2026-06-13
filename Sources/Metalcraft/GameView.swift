@@ -50,6 +50,12 @@ final class GameView: MTKView {
         super.init(frame: frame, device: device)
         colorPixelFormat = .bgra8Unorm
         depthStencilPixelFormat = .depth32Float
+        // The texture pack's PNGs are sRGB and the shaders do gamma-space
+        // math on the raw values, exactly like beta's unmanaged GL pipeline.
+        // Tagging the layer sRGB makes macOS color-match the output to the
+        // display; untagged, wide-gamut screens interpret the values as P3
+        // and everything comes out oversaturated.
+        colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         clearColor = MTLClearColor(red: 0.55, green: 0.74, blue: 0.95, alpha: 1)
         NotificationCenter.default.addObserver(
             self, selector: #selector(windowResigned),

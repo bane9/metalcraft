@@ -77,9 +77,6 @@ enum Mesher {
         [SIMD3(0, 0, 1), SIMD3(1, 0, 1), SIMD3(1, 1, 1), SIMD3(0, 1, 1)],
         [SIMD3(0, 0, 0), SIMD3(0, 1, 0), SIMD3(1, 1, 0), SIMD3(1, 0, 0)],
     ]
-    /// The two axes spanning each face, for smooth-light corner sampling.
-    static let tangents: [(Int, Int)] = [(1, 2), (1, 2), (0, 2), (0, 2), (0, 1), (0, 1)]
-
     // texture v runs top-to-bottom, so v = 1 - worldY on side faces
     static let uvCorners: [[SIMD2<Float>]] = [
         [SIMD2(0, 1), SIMD2(0, 0), SIMD2(1, 0), SIMD2(1, 1)], // +X
@@ -444,23 +441,13 @@ enum Mesher {
         geo.opaqueVertices.reserveCapacity(16384)
         geo.opaqueIndices.reserveCapacity(4096)
 
-        /// Smooth lighting: each face corner averages the four cells that
-        /// touch it in the face plane; solid cells contribute 0, which doubles
-        /// as soft ambient occlusion in corners.
+        /// Flat lighting like the classic game: every face takes the single
+        /// light value of the cell it opens into — no per-corner averaging,
+        /// so no gradients or soft occlusion creeping in at block corners.
         func cornerLights(_ dir: Int, _ x: Int, _ y: Int, _ z: Int) -> [SIMD2<Float>] {
             let o = offsets[dir]
-            let n = SIMD3<Int>(x + o.x, y + o.y, z + o.z)
-            let (t1, t2) = tangents[dir]
-            return corners[dir].map { corner in
-                var e1 = SIMD3<Int>.zero, e2 = SIMD3<Int>.zero
-                e1[t1] = corner[t1] > 0.5 ? 1 : -1
-                e2[t2] = corner[t2] > 0.5 ? 1 : -1
-                let a = snap.light(n.x, n.y, n.z)
-                let b = snap.light(n.x + e1.x, n.y + e1.y, n.z + e1.z)
-                let c = snap.light(n.x + e2.x, n.y + e2.y, n.z + e2.z)
-                let d = snap.light(n.x + e1.x + e2.x, n.y + e1.y + e2.y, n.z + e1.z + e2.z)
-                return (a + b + c + d) / 4
-            }
+            let l = snap.light(x + o.x, y + o.y, z + o.z)
+            return [l, l, l, l]
         }
 
         let x0 = coord.x * World.chunkSize, z0 = coord.z * World.chunkSize

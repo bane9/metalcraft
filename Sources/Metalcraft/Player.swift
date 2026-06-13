@@ -48,9 +48,14 @@ func raycast(origin: SIMD3<Float>, dir: SIMD3<Float>, maxDist: Float, world: Wor
 }
 
 final class Player {
-    static let halfWidth: Float = 0.3
-    static let height: Float = 1.8
-    static let eyeHeight: Float = 1.62
+    /// The player's physical proportions relative to the 1 m block grid.
+    /// Below 1 the eye sits lower and the body is narrower, so every block
+    /// reads bigger — the camera setup itself stays Minecraft-accurate.
+    static let scale: Float = 0.9
+
+    static let halfWidth: Float = 0.3 * scale
+    static let height: Float = 1.8 * scale
+    static let eyeHeight: Float = 1.62 * scale
 
     var pos = SIMD3<Float>(8, 50, 8) // feet center
     var vel = SIMD3<Float>.zero
@@ -133,7 +138,7 @@ final class Player {
             if input.sprint { wish.y -= 1 } // shift descends while flying
             if simd_length_squared(wish) > 0 { wish = simd_normalize(wish) }
             let blend = 1 - exp(-8 * dt)
-            let flySpeed: Float = input.sprintTap ? 27 : 18 // 2×W boosts flight too
+            let flySpeed: Float = (input.sprintTap ? 27 : 18) * Self.scale // 2×W boosts flight too
             vel += (wish * flySpeed - vel) * blend
             move(axis: 1, by: vel.y * dt, world: world)
             move(axis: 0, by: vel.x * dt, world: world)
@@ -165,7 +170,8 @@ final class Player {
         let drag: Float = onGround ? 10 : (inWater ? 5 : 0.4)
         hvel *= exp(-drag * dt)
         if simd_length_squared(wishDir) > 0 {
-            let targetSpeed: Float = inWater ? 3.4 : (input.sprint || input.sprintTap ? 7.8 : 4.8)
+            let targetSpeed: Float = (inWater ? 3.4 : (input.sprint || input.sprintTap ? 7.8 : 4.8))
+                * Self.scale
             let currentSpeed = simd_dot(hvel, wishDir)
             let addSpeed = targetSpeed - currentSpeed
             if addSpeed > 0 {

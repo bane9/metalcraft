@@ -646,12 +646,13 @@ final class Renderer: NSObject, MTKViewDelegate {
               let cmd = queue.makeCommandBuffer(),
               let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
 
-        // sprint widens the FOV slightly (like the real game) so the speed
-        // change reads instantly; eased both ways so it never pops
+        // Minecraft's default FOV — wider makes blocks read smaller than
+        // they should. Sprint widens it ~15% (like the real game) so the
+        // speed change reads instantly; eased both ways so it never pops.
         let sprinting = input.captured && !paused && input.keys.contains(Keys.w)
             && (input.sprintTap || (input.sprint && !player.flying))
         sprintFovBlend += ((sprinting ? 1 : 0) - sprintFovBlend) * (1 - exp(-10 * dt))
-        let fov = (85 + 10 * sprintFovBlend) * Float.pi / 180
+        let fov = (70 + 10 * sprintFovBlend) * Float.pi / 180
         let proj = perspectiveMatrix(fovY: fov, aspect: aspect, near: 0.05, far: 600)
         let viewM = lookAtMatrix(eye: eye, center: eye + player.forward, up: SIMD3(0, 1, 0))
         let viewProj = proj * viewM
@@ -772,6 +773,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             let bob = abs(cos(player.bobPhase)) * 0.06 * min(player.bobAmount, 1)
             let entity = translationMatrix(player.pos + SIMD3(0, bob, 0))
                 * rotationYMatrix(-player.yaw)
+                * scaleMatrix(SIMD3(repeating: Player.scale)) // model matches the hitbox
             let l = world.lightAt(Int(player.pos.x.rounded(.down)),
                                   Int(player.eye.y.rounded(.down)),
                                   Int(player.pos.z.rounded(.down)))
